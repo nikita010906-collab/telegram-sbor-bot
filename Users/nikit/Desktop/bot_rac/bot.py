@@ -2,12 +2,13 @@ import sqlite3
 import logging
 import re
 import os
+import sys
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # ============ НАСТРОЙКИ ============
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # ← ЗАМЕНИТЕ на новый после revoke
-ADMIN_IDS = [1920218354]   # сюда впишите ваш user_id (узнать: /id). Пусто = любой админ.
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_IDS = [1920218354]   # ваш user_id
 DB_PATH = "collections.db"
 # ===================================
 
@@ -81,6 +82,13 @@ def get_active_collection():
     return row
 
 
+def get_collection(cid):
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("SELECT id, title FROM collections WHERE id=?", (cid,)).fetchone()
+    conn.close()
+    return row
+
+
 def get_members(cid):
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute(
@@ -91,8 +99,7 @@ def get_members(cid):
 
 
 def mark_paid(cid, family):
-    """Возвращает ('ok', имя) | ('already', имя) | ('not_found', None).
-    Регистронезависимо для любого Юникода (включая кириллицу)."""
+    """Регистронезависимо для любого Юникода (включая кириллицу)."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     rows = c.execute(
@@ -114,76 +121,6 @@ def mark_paid(cid, family):
     conn.commit()
     conn.close()
     return "ok", matched[1]
-
-
-def get_collection(cid):
-    conn = sqlite3.connect(DB_PATH)
-    row = conn.execute("SELECT id, title FROM collections WHERE id=?", (cid,)).fetchone()
-    conn.close()
-    return row
-
-
-def find_unpaid_in_past(family):
-    """Ищет неуплаченные записи с этой фамилией во всех НЕактивных сборах.
-    Возвращает список (collection_id, title, member_id, family)."""
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute("""
-        SELECT c.id, c.title, m.id, m.family
-        FROM members m
-        JOIN collections c ON c.id = m.collection_id
-        WHERE c.active = 0 AND m.paid = 0
-    """).fetchall()
-    conn.close()
-    target = family.strip().lower()
-    return [r for r in rows if r[3].strip().lower() == target]
-
-
-def mark_paid(cid, family):
-    """Возвращает ('ok', имя) | ('already', имя) | ('not_found', None).
-    Регистронезависимо для любого Юникода (включая кириллицу)."""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    rows = c.execute(
-        "SELECT id, family, paid FROM members WHERE collection_id=?", (cid,)
-    ).fetchall()
-    target = family.strip().lower()
-    matched = None
-    for r in rows:
-        if r[1].strip().lower() == target:
-            matched = r
-            break
-    if not matched:
-        conn.close()
-        return "not_found", None
-    if matched[2]:
-        conn.close()
-        return "already", matched[1]
-    c.execute("UPDATE members SET paid=1, paid_at=CURRENT_TIMESTAMP WHERE id=?", (matched[0],))
-    conn.commit()
-    conn.close()
-    return "ok", matched[1]
-
-
-def get_collection(cid):
-    conn = sqlite3.connect(DB_PATH)
-    row = conn.execute("SELECT id, title FROM collections WHERE id=?", (cid,)).fetchone()
-    conn.close()
-    return row
-
-
-def find_unpaid_in_past(family):
-    """Ищет неуплаченные записи с этой фамилией во всех НЕактивных сборах.
-    Возвращает список (collection_id, title, member_id, family)."""
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute("""
-        SELECT c.id, c.title, m.id, m.family
-        FROM members m
-        JOIN collections c ON c.id = m.collection_id
-        WHERE c.active = 0 AND m.paid = 0
-    """).fetchall()
-    conn.close()
-    target = family.strip().lower()
-    return [r for r in rows if r[3].strip().lower() == target]
 
 
 def mark_paid_by_member_id(mid):
@@ -200,6 +137,19 @@ def mark_paid_by_member_id(mid):
     conn.commit()
     conn.close()
     return "ok", row[0]
+
+
+def find_unpaid_in_past(family):
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute("""
+        SELECT c.id, c.title, m.id, m.family
+        FROM members m
+        JOIN collections c ON c.id = m.collection_id
+        WHERE c.active = 0 AND m.paid = 0
+    """).fetchall()
+    conn.close()
+    target = family.strip().lower()
+    return [r for r in rows if r[3].strip().lower() == target]
 
 
 def get_all_collections():
@@ -251,14 +201,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "👋 Привет! Я бот для сбора средств.\n\n"
         "*Команды администратора:*\n"
-        "/setfamilies — задать список фамилий (после команды, каждую с новой строки или через запятую)\n"
+        "/setfamilies — задать список фамилий (каждую с новой строки или через запятую)\n"
         "/families — показать текущий список фамилий\n"
-        "/new <описание> — начать новый сбор (или напишите «Новый сбор <описание>»)\n"
+        "/new <описание> — начать новый сбор (или «Новый сбор <описание>»)\n"
         "/all — показать все сборы с описанием и статусами\n"
         "/check <Фамилия> — проверить, где числится фамилия\n"
         "/restart — перезапустить бота\n\n"
         "*Для участников:*\n"
-        "Напишите «Фамилия скинул» (или «скинула»/«оплатил») — я отмечу оплату.\n\n"
+        "Напишите «Фамилия скинул» или «Фамилия +» — я отмечу оплату.\n"
+        "Можно указать прошлый сбор: «Фамилия + #2».\n\n"
         "«Список должников» — покажу, кто ещё не сдал."
     )
     await update.message.reply_text(text, parse_mode="Markdown")
@@ -322,7 +273,7 @@ async def start_new_collection(update: Update, title: str):
     listing = "\n".join(f"{i+1}. {f}" for i, f in enumerate(families))
     await update.message.reply_text(
         f"📢 *Новый сбор #{cid}:* {title}\n\n👥 Кто участвует:\n{listing}\n\n"
-        f"Когда сдадите — напишите «Фамилия скинул».",
+        f"Когда сдадите — напишите «Фамилия скинул» или «Фамилия +».",
         parse_mode="Markdown",
     )
 
@@ -389,19 +340,6 @@ async def cmd_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(part, parse_mode="Markdown")
 
 
-# ---------- Обработка обычных сообщений ----------
-async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Только администратор.")
-        return
-    await update.message.reply_text("🔄 Перезапускаю бота... Через 5–10 секунд снова будет в строю.")
-    import sys
-    logging.info("Bot restart requested by admin")
-    sys.stdout.flush()
-    sys.stderr.flush()
-    os._exit(1)   # BotHost автоматически поднимет процесс заново
-
-
 async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Только администратор.")
@@ -424,7 +362,7 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     found = []
     for cid, title, active, fam, paid in rows:
-        if query in fam.lower():   # частичное совпадение
+        if query in fam.lower():
             status = "🟢 активный" if active else "⚪ завершён"
             mark = "✅ оплачено" if paid else "❌ не оплачено"
             found.append(f"• #{cid} «{title}» ({status}) — {fam}: {mark}")
@@ -435,15 +373,33 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Текущий список фамилий
     fams = get_families()
     fams_match = [f for f in fams if query in f.lower()]
     msg = "🔎 *Результаты поиска:*\n\n" + "\n".join(found)
     if fams_match:
         msg += "\n\n📋 В общем списке фамилий: " + ", ".join(fams_match)
     else:
-        msg += "\n\n📋 В общем списке фамилий совпадений нет (только в сборах)."
+        msg += "\n\n📋 В общем списке фамилий совпадений нет."
     await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Только администратор.")
+        return
+    await update.message.reply_text("🔄 Перезапускаю бота... Через 5–15 секунд снова будет в строю.")
+    logging.info("Bot restart requested by admin")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(1)
+
+
+# ---------- Обработка обычных сообщений ----------
+async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+    text = update.message.text.strip()
+    lower = text.lower()
 
     # 1) Список должников / сдавших
     if lower in ("список должников", "должники", "кто не сдал", "список сдавших"):
@@ -461,7 +417,7 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_debtors(update, context)
         return
 
-    # 2) Новый сбор текстом: «Новый сбор ...» или «Сбор ...»
+    # 2) Новый сбор текстом
     m = re.match(r"^(?:новый\s+)?сбор\s+(.+)$", text, re.IGNORECASE)
     if m:
         if not is_admin(update.effective_user.id):
@@ -470,13 +426,12 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await start_new_collection(update, m.group(1).strip())
         return
 
-    # 3) «Фамилия скинул/скинула/оплатил...» (+ опционально «в сборе N» или «#N»)
+    # 3) «Фамилия скинул/оплатил/+» и опционально «#N»
     m = PAID_RE.match(text)
     if m:
         family = m.group(1)
         explicit_cid = int(m.group(3)) if m.group(3) else None
 
-        # --- Если явно указан сбор ---
         if explicit_cid:
             col = get_collection(explicit_cid)
             if not col:
@@ -497,7 +452,6 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             return
 
-        # --- Иначе: сначала активный сбор ---
         active = get_active_collection()
         if active:
             cid, title = active
@@ -513,7 +467,6 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
-        # --- Ищем в прошлых сборах ---
         past = find_unpaid_in_past(family)
         if len(past) == 1:
             pcid, ptitle, mid, pfam = past[0]
@@ -535,10 +488,10 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # --- Ничего не найдено ---
         if active:
             await update.message.reply_text(
-                f"⚠️ «{family}» не найден в текущем сборе «{active[1]}» и в прошлых сборах."
+                f"⚠️ «{family}» не найден в текущем сборе «{active[1]}» и в прошлых сборах.\n"
+                f"Проверьте написание или используйте /check."
             )
         else:
             await update.message.reply_text(
@@ -559,8 +512,8 @@ def main():
     app.add_handler(CommandHandler("families", cmd_families))
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("all", cmd_all))
-    app.add_handler(CommandHandler("restart", cmd_restart))
     app.add_handler(CommandHandler("check", cmd_check))
+    app.add_handler(CommandHandler("restart", cmd_restart))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 

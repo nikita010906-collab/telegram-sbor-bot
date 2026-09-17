@@ -254,7 +254,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/setfamilies — задать список фамилий (после команды, каждую с новой строки или через запятую)\n"
         "/families — показать текущий список фамилий\n"
         "/new <описание> — начать новый сбор (или напишите «Новый сбор <описание>»)\n"
-        "/all — показать все сборы с описанием и статусами\n\n"
+        "/all — показать все сборы с описанием и статусами\n"
+        "/check <Фамилия> — проверить, где числится фамилия\n"
+        "/restart — перезапустить бота\n\n"
         "*Для участников:*\n"
         "Напишите «Фамилия скинул» (или «скинула»/«оплатил») — я отмечу оплату.\n\n"
         "«Список должников» — покажу, кто ещё не сдал."
@@ -388,11 +390,60 @@ async def cmd_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------- Обработка обычных сообщений ----------
-async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
+async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Только администратор.")
         return
-    text = update.message.text.strip()
-    lower = text.lower()
+    await update.message.reply_text("🔄 Перезапускаю бота... Через 5–10 секунд снова будет в строю.")
+    import sys
+    logging.info("Bot restart requested by admin")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(1)   # BotHost автоматически поднимет процесс заново
+
+
+async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Только администратор.")
+        return
+    text = update.message.text or ""
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await update.message.reply_text("Использование: /check <Фамилия>")
+        return
+    query = parts[1].strip().lower()
+
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute("""
+        SELECT c.id, c.title, c.active, m.family, m.paid
+        FROM members m
+        JOIN collections c ON c.id = m.collection_id
+        ORDER BY c.id
+    """).fetchall()
+    conn.close()
+
+    found = []
+    for cid, title, active, fam, paid in rows:
+        if query in fam.lower():   # частичное совпадение
+            status = "🟢 активный" if active else "⚪ завершён"
+            mark = "✅ оплачено" if paid else "❌ не оплачено"
+            found.append(f"• #{cid} «{title}» ({status}) — {fam}: {mark}")
+
+    if not found:
+        await update.message.reply_text(
+            f"❌ Фамилия, содержащая «{query}», не найдена ни в одном сборе."
+        )
+        return
+
+    # Текущий список фамилий
+    fams = get_families()
+    fams_match = [f for f in fams if query in f.lower()]
+    msg = "🔎 *Результаты поиска:*\n\n" + "\n".join(found)
+    if fams_match:
+        msg += "\n\n📋 В общем списке фамилий: " + ", ".join(fams_match)
+    else:
+        msg += "\n\n📋 В общем списке фамилий совпадений нет (только в сборах)."
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
     # 1) Список должников / сдавших
     if lower in ("список должников", "должники", "кто не сдал", "список сдавших"):
@@ -508,6 +559,8 @@ def main():
     app.add_handler(CommandHandler("families", cmd_families))
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("all", cmd_all))
+    app.add_handler(CommandHandler("restart", cmd_restart))
+    app.add_handler(CommandHandler("check", cmd_check))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 

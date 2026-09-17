@@ -91,24 +91,115 @@ def get_members(cid):
 
 
 def mark_paid(cid, family):
+    """Возвращает ('ok', имя) | ('already', имя) | ('not_found', None).
+    Регистронезависимо для любого Юникода (включая кириллицу)."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    row = c.execute(
-        "SELECT id, family, paid FROM members WHERE collection_id=? AND LOWER(family)=LOWER(?)",
-        (cid, family),
-    ).fetchone()
+    rows = c.execute(
+        "SELECT id, family, paid FROM members WHERE collection_id=?", (cid,)
+    ).fetchall()
+    target = family.strip().lower()
+    matched = None
+    for r in rows:
+        if r[1].strip().lower() == target:
+            matched = r
+            break
+    if not matched:
+        conn.close()
+        return "not_found", None
+    if matched[2]:
+        conn.close()
+        return "already", matched[1]
+    c.execute("UPDATE members SET paid=1, paid_at=CURRENT_TIMESTAMP WHERE id=?", (matched[0],))
+    conn.commit()
+    conn.close()
+    return "ok", matched[1]
+
+
+def get_collection(cid):
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("SELECT id, title FROM collections WHERE id=?", (cid,)).fetchone()
+    conn.close()
+    return row
+
+
+def find_unpaid_in_past(family):
+    """Ищет неуплаченные записи с этой фамилией во всех НЕактивных сборах.
+    Возвращает список (collection_id, title, member_id, family)."""
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute("""
+        SELECT c.id, c.title, m.id, m.family
+        FROM members m
+        JOIN collections c ON c.id = m.collection_id
+        WHERE c.active = 0 AND m.paid = 0
+    """).fetchall()
+    conn.close()
+    target = family.strip().lower()
+    return [r for r in rows if r[3].strip().lower() == target]
+
+
+def mark_paid(cid, family):
+    """Возвращает ('ok', имя) | ('already', имя) | ('not_found', None).
+    Регистронезависимо для любого Юникода (включая кириллицу)."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    rows = c.execute(
+        "SELECT id, family, paid FROM members WHERE collection_id=?", (cid,)
+    ).fetchall()
+    target = family.strip().lower()
+    matched = None
+    for r in rows:
+        if r[1].strip().lower() == target:
+            matched = r
+            break
+    if not matched:
+        conn.close()
+        return "not_found", None
+    if matched[2]:
+        conn.close()
+        return "already", matched[1]
+    c.execute("UPDATE members SET paid=1, paid_at=CURRENT_TIMESTAMP WHERE id=?", (matched[0],))
+    conn.commit()
+    conn.close()
+    return "ok", matched[1]
+
+
+def get_collection(cid):
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("SELECT id, title FROM collections WHERE id=?", (cid,)).fetchone()
+    conn.close()
+    return row
+
+
+def find_unpaid_in_past(family):
+    """Ищет неуплаченные записи с этой фамилией во всех НЕактивных сборах.
+    Возвращает список (collection_id, title, member_id, family)."""
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute("""
+        SELECT c.id, c.title, m.id, m.family
+        FROM members m
+        JOIN collections c ON c.id = m.collection_id
+        WHERE c.active = 0 AND m.paid = 0
+    """).fetchall()
+    conn.close()
+    target = family.strip().lower()
+    return [r for r in rows if r[3].strip().lower() == target]
+
+
+def mark_paid_by_member_id(mid):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    row = c.execute("SELECT family, paid FROM members WHERE id=?", (mid,)).fetchone()
     if not row:
         conn.close()
         return "not_found", None
-    if row[2]:
+    if row[1]:
         conn.close()
-        return "already", row[1]
-    c.execute(
-        "UPDATE members SET paid=1, paid_at=CURRENT_TIMESTAMP WHERE id=?", (row[0],)
-    )
+        return "already", row[0]
+    c.execute("UPDATE members SET paid=1, paid_at=CURRENT_TIMESTAMP WHERE id=?", (mid,))
     conn.commit()
     conn.close()
-    return "ok", row[1]
+    return "ok", row[0]
 
 
 def get_all_collections():
@@ -148,8 +239,9 @@ def split_long(text: str, limit: int = 3800):
 
 
 PAID_RE = re.compile(
-    r"^\s*([А-ЯЁA-Zа-яёa-z][А-ЯЁA-Zа-яёa-z\-']{1,40})\s+"
-    r"(скинул[аи]?|оплатил[а]?|перев[её]л[а]?|отправил[а]?|заплатил[а]?)\b",
+    r"^\s*([А-ЯЁA-Zа-яёa-z][А-ЯЁA-Zа-яёa-z\-']{1,40})\s*"
+    r"(скинул[аи]?|оплатил[а]?|перев[её]л[а]?|отправил[а]?|заплатил[а]?|\+)"
+    r"(?:\s*(?:в\s+сборе|сборе|#)\s*(\d+))?\s*$",
     re.IGNORECASE,
 )
 
@@ -327,27 +419,79 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await start_new_collection(update, m.group(1).strip())
         return
 
-    # 3) «Фамилия скинул/скинула/оплатил...»
+    # 3) «Фамилия скинул/скинула/оплатил...» (+ опционально «в сборе N» или «#N»)
     m = PAID_RE.match(text)
     if m:
         family = m.group(1)
-        active = get_active_collection()
-        if not active:
+        explicit_cid = int(m.group(3)) if m.group(3) else None
+
+        # --- Если явно указан сбор ---
+        if explicit_cid:
+            col = get_collection(explicit_cid)
+            if not col:
+                await update.message.reply_text(f"⚠️ Сбор #{explicit_cid} не найден.")
+                return
+            status, name = mark_paid(explicit_cid, family)
+            if status == "ok":
+                await update.message.reply_text(
+                    f"✅ {name} — оплата отмечена по сбору «{col[1]}» (#{explicit_cid})."
+                )
+            elif status == "already":
+                await update.message.reply_text(
+                    f"ℹ️ {name} уже отмечен как оплативший по сбору «{col[1]}»."
+                )
+            else:
+                await update.message.reply_text(
+                    f"⚠️ «{family}» не найден в сборе «{col[1]}»."
+                )
             return
-        cid, title = active
-        status, name = mark_paid(cid, family)
-        if status == "ok":
+
+        # --- Иначе: сначала активный сбор ---
+        active = get_active_collection()
+        if active:
+            cid, title = active
+            status, name = mark_paid(cid, family)
+            if status == "ok":
+                await update.message.reply_text(
+                    f"✅ {name} — оплата отмечена по сбору «{title}»."
+                )
+                return
+            if status == "already":
+                await update.message.reply_text(
+                    f"ℹ️ {name} уже отмечен как оплативший по сбору «{title}»."
+                )
+                return
+
+        # --- Ищем в прошлых сборах ---
+        past = find_unpaid_in_past(family)
+        if len(past) == 1:
+            pcid, ptitle, mid, pfam = past[0]
+            status, name = mark_paid_by_member_id(mid)
+            if status == "ok":
+                await update.message.reply_text(
+                    f"✅ {name} — оплата отмечена по прошлому сбору «{ptitle}» (#{pcid})."
+                )
+            else:
+                await update.message.reply_text(
+                    f"ℹ️ {name} уже отмечен по сбору «{ptitle}»."
+                )
+            return
+        if len(past) > 1:
+            listing = "\n".join(f"• #{c} — {t}" for c, t, _, _ in past)
             await update.message.reply_text(
-                f"✅ {name} — оплата отмечена по сбору «{title}»."
+                f"⚠️ Найдено несколько прошлых сборов с «{family}»:\n{listing}\n\n"
+                f"Уточните, например: «{family} + #{past[0][0]}»"
             )
-        elif status == "already":
+            return
+
+        # --- Ничего не найдено ---
+        if active:
             await update.message.reply_text(
-                f"ℹ️ {name} уже отмечен как оплативший по сбору «{title}»."
+                f"⚠️ «{family}» не найден в текущем сборе «{active[1]}» и в прошлых сборах."
             )
         else:
             await update.message.reply_text(
-                f"⚠️ «{family}» не найден в текущем сборе «{title}». "
-                f"Проверьте фамилию или обратитесь к администратору."
+                f"⚠️ «{family}» не найден в прошлых сборах."
             )
         return
 

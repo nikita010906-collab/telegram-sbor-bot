@@ -1,12 +1,13 @@
 import sqlite3
 import logging
 import re
+import os
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # ============ НАСТРОЙКИ ============
-BOT_TOKEN = "8843690578:AAFdNuKWudFgaZncGi37VYEaKlzaossB1JM"  # ← ЗАМЕНИТЕ на новый после revoke
-ADMIN_IDS = []   # сюда впишите ваш user_id (узнать: /id). Пусто = любой админ.
+BOT_TOKEN = os.getenv("BOT_TOKEN")  # ← ЗАМЕНИТЕ на новый после revoke
+ADMIN_IDS = [1920218354]   # сюда впишите ваш user_id (узнать: /id). Пусто = любой админ.
 DB_PATH = "collections.db"
 # ===================================
 

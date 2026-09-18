@@ -8,7 +8,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 
 # ============ НАСТРОЙКИ ============
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = [1920218354]   # ваш user_id
+ADMIN_IDS = [1920218354]
 DB_PATH = "collections.db"
 # ===================================
 
@@ -22,12 +22,14 @@ logging.basicConfig(
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+
     c.execute("""CREATE TABLE IF NOT EXISTS collections (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         title TEXT NOT NULL,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
         active INTEGER DEFAULT 1,
-        amount INTEGER DEFAULT 0
+        amount INTEGER DEFAULT 0,
+        chat_id INTEGER DEFAULT 0
     )""")
     c.execute("""CREATE TABLE IF NOT EXISTS members (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -38,7 +40,9 @@ def init_db():
     )""")
     c.execute("""CREATE TABLE IF NOT EXISTS families (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT UNIQUE NOT NULL
+        chat_id INTEGER DEFAULT 0,
+        name TEXT NOT NULL,
+        UNIQUE(chat_id, name)
     )""")
     c.execute("""CREATE TABLE IF NOT EXISTS family_contacts (
         family TEXT UNIQUE NOT NULL,
@@ -47,37 +51,64 @@ def init_db():
         full_name TEXT
     )""")
 
-    # Миграция: добавить колонку amount, если её нет (для старых баз)
+    # --- МИГРАЦИИ для старых баз ---
+    # collections: добавить amount
     cols = [row[1] for row in c.execute("PRAGMA table_info(collections)").fetchall()]
     if "amount" not in cols:
         c.execute("ALTER TABLE collections ADD COLUMN amount INTEGER DEFAULT 0")
+    # collections: добавить chat_id
+    if "chat_id" not in cols:
+        c.execute("ALTER TABLE collections ADD COLUMN chat_id INTEGER DEFAULT 0")
+
+    # families: пересоздать таблицу с chat_id, если её нет
+    fam_cols = [row[1] for row in c.execute("PRAGMA table_info(families)").fetchall()]
+    if "chat_id" not in fam_cols:
+        c.execute("ALTER TABLE families RENAME TO families_old")
+        c.execute("""CREATE TABLE families (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER DEFAULT 0,
+            name TEXT NOT NULL,
+            UNIQUE(chat_id, name)
+        )""")
+        c.execute("INSERT INTO families (chat_id, name) SELECT 0, name FROM families_old")
+        c.execute("DROP TABLE families_old")
 
     conn.commit()
     conn.close()
 
 
-def get_families():
+# ---------- Фамилии (по чату) ----------
+def get_families(chat_id):
     conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute("SELECT name FROM families ORDER BY name").fetchall()
+    rows = conn.execute(
+        "SELECT name FROM families WHERE chat_id=? ORDER BY name", (chat_id,)
+    ).fetchall()
     conn.close()
     return [r[0] for r in rows]
 
 
-def set_families(names):
+def set_families(chat_id, names):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("DELETE FROM families")
+    c.execute("DELETE FROM families WHERE chat_id=?", (chat_id,))
     for n in names:
-        c.execute("INSERT OR IGNORE INTO families (name) VALUES (?)", (n,))
+        c.execute(
+            "INSERT OR IGNORE INTO families (chat_id, name) VALUES (?, ?)",
+            (chat_id, n),
+        )
     conn.commit()
     conn.close()
 
 
-def create_collection(title, families, amount=0):
+# ---------- Сборы (по чату) ----------
+def create_collection(chat_id, title, families, amount=0):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("UPDATE collections SET active=0 WHERE active=1")
-    c.execute("INSERT INTO collections (title, active, amount) VALUES (?, 1, ?)", (title, amount))
+    c.execute("UPDATE collections SET active=0 WHERE active=1 AND chat_id=?", (chat_id,))
+    c.execute(
+        "INSERT INTO collections (title, active, amount, chat_id) VALUES (?, 1, ?, ?)",
+        (title, amount, chat_id),
+    )
     cid = c.lastrowid
     for f in families:
         c.execute("INSERT INTO members (collection_id, family) VALUES (?, ?)", (cid, f))
@@ -86,20 +117,28 @@ def create_collection(title, families, amount=0):
     return cid
 
 
-def get_active_collection():
+def get_active_collection(chat_id):
     conn = sqlite3.connect(DB_PATH)
     row = conn.execute(
-        "SELECT id, title, amount FROM collections WHERE active=1 ORDER BY id DESC LIMIT 1"
+        "SELECT id, title, amount FROM collections WHERE active=1 AND chat_id=? "
+        "ORDER BY id DESC LIMIT 1",
+        (chat_id,),
     ).fetchone()
     conn.close()
     return row
 
 
-def get_collection(cid):
+def get_collection(cid, chat_id=None):
     conn = sqlite3.connect(DB_PATH)
-    row = conn.execute(
-        "SELECT id, title, amount FROM collections WHERE id=?", (cid,)
-    ).fetchone()
+    if chat_id is None:
+        row = conn.execute(
+            "SELECT id, title, amount FROM collections WHERE id=?", (cid,)
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT id, title, amount FROM collections WHERE id=? AND chat_id=?",
+            (cid, chat_id),
+        ).fetchone()
     conn.close()
     return row
 
@@ -114,7 +153,6 @@ def get_members(cid):
 
 
 def mark_paid(cid, family):
-    """Регистронезависимо для любого Юникода (включая кириллицу)."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     rows = c.execute(
@@ -139,7 +177,6 @@ def mark_paid(cid, family):
 
 
 def unmark_paid(cid, family):
-    """Снимает отметку об оплате (возвращает в должники)."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     rows = c.execute(
@@ -179,24 +216,26 @@ def mark_paid_by_member_id(mid):
     return "ok", row[0]
 
 
-def find_unpaid_in_past(family):
+def find_unpaid_in_past(chat_id, family):
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute("""
         SELECT c.id, c.title, m.id, m.family
         FROM members m
         JOIN collections c ON c.id = m.collection_id
-        WHERE c.active = 0 AND m.paid = 0
-    """).fetchall()
+        WHERE c.active = 0 AND m.paid = 0 AND c.chat_id = ?
+    """, (chat_id,)).fetchall()
     conn.close()
     target = family.strip().lower()
     return [r for r in rows if r[3].strip().lower() == target]
 
 
-def get_all_collections():
+def get_all_collections(chat_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     rows = c.execute(
-        "SELECT id, title, created_at, active, amount FROM collections ORDER BY id"
+        "SELECT id, title, created_at, active, amount FROM collections "
+        "WHERE chat_id=? ORDER BY id",
+        (chat_id,),
     ).fetchall()
     result = []
     for r in rows:
@@ -211,21 +250,33 @@ def get_all_collections():
     return result
 
 
-def get_all_debtors():
-    """Возвращает список (cid, title, amount, family) для всех неуплаченных."""
+def get_all_debtors(chat_id):
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute("""
         SELECT c.id, c.title, c.amount, m.family
         FROM members m
         JOIN collections c ON c.id = m.collection_id
-        WHERE m.paid = 0
+        WHERE m.paid = 0 AND c.chat_id = ?
         ORDER BY c.id DESC, m.family
-    """).fetchall()
+    """, (chat_id,)).fetchall()
     conn.close()
     return [(r[0], r[1], r[2] or 0, r[3]) for r in rows]
 
 
-# ---------- Контакты (упоминания) ----------
+def bind_old_data_to_chat(chat_id):
+    """Привязывает старые записи (chat_id=0) к текущему чату."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE collections SET chat_id=? WHERE chat_id=0", (chat_id,))
+    col_n = c.rowcount
+    c.execute("UPDATE families SET chat_id=? WHERE chat_id=0", (chat_id,))
+    fam_n = c.rowcount
+    conn.commit()
+    conn.close()
+    return col_n, fam_n
+
+
+# ---------- Контакты ----------
 def save_contact(family, username, user_id, full_name):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -271,7 +322,6 @@ def delete_contact(family):
 
 
 def format_mention(family):
-    """Возвращает @username, ссылку-упоминание или просто фамилию."""
     contact = get_contact(family)
     if not contact:
         return family
@@ -301,26 +351,11 @@ def split_long(text: str, limit: int = 3800):
     return parts
 
 
-def format_money(amount):
-    """Форматирует сумму. 0 → '—', иначе '300 ₽'."""
-    if not amount:
-        return "—"
-    return f"{amount} ₽"
-
-
 def parse_new_collection_text(body):
-    """Извлекает название и сумму из строки.
-    Поддерживает:
-      'Сбор на подарок 300'      → ('Сбор на подарок', 300)
-      'Сбор на подарок 300 руб'  → ('Сбор на подарок', 300)
-      'Сбор на подарок | 300'    → ('Сбор на подарок', 300)
-      'Сбор на подарок'          → ('Сбор на подарок', 0)
-    """
     body = body.strip()
     if not body:
         return body, 0
 
-    # Явный разделитель |
     if "|" in body:
         left, right = body.rsplit("|", 1)
         nums = re.sub(r"[^\d]", "", right)
@@ -330,7 +365,6 @@ def parse_new_collection_text(body):
             amount = 0
         return left.strip(), amount
 
-    # Число в конце строки
     m = re.match(r"^(.*?)\s+(\d+)\s*(?:руб(?:лей|ля|\.)?|₽|р\.?)?\s*$", body, re.IGNORECASE)
     if m:
         return m.group(1).strip(), int(m.group(2))
@@ -354,17 +388,18 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/setfamilies — задать список фамилий\n"
         "/families — показать список фамилий\n"
         "/new <описание> [сумма] — новый сбор. Пример: `/new Подарок 300`\n"
-        "/all — все сборы с описанием и статусами\n"
+        "/all — все сборы в этом чате\n"
         "/check <Фамилия> — где числится фамилия\n"
         "/unpay <Фамилия> [#N] — вернуть в должники\n"
         "/setuser <Фамилия> [@username] — привязать Telegram\n"
         "/unsetuser <Фамилия> — удалить привязку\n"
         "/users — список привязок\n"
+        "/bindold — привязать старые сборы к этому чату (одноразово)\n"
         "/restart — перезапустить бота\n\n"
         "*Для участников:*\n"
         "Напишите «Фамилия скинул» или «Фамилия +» — отмечу оплату.\n"
         "Можно указать прошлый сбор: «Фамилия + #2».\n\n"
-        "«Список должников» — покажу всех должников по всем сборам с итогами."
+        "«Список должников» — покажу всех должников этого чата с итогами."
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -380,6 +415,7 @@ async def cmd_setfamilies(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Только администратор может менять список.")
         return
+    chat_id = update.effective_chat.id
     text = update.message.text or ""
     parts = text.split(maxsplit=1)
     body = parts[1] if len(parts) > 1 else ""
@@ -402,28 +438,30 @@ async def cmd_setfamilies(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    set_families(unique)
+    set_families(chat_id, unique)
     await update.message.reply_text(
-        f"✅ Сохранено {len(unique)} фамилий:\n" + ", ".join(unique)
+        f"✅ Сохранено {len(unique)} фамилий для этого чата:\n" + ", ".join(unique)
     )
 
 
 async def cmd_families(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    fams = get_families()
+    chat_id = update.effective_chat.id
+    fams = get_families(chat_id)
     if not fams:
         await update.message.reply_text("Список пуст. Задайте через /setfamilies")
         return
-    await update.message.reply_text("👥 Список фамилий:\n" + ", ".join(fams))
+    await update.message.reply_text("👥 Список фамилий этого чата:\n" + ", ".join(fams))
 
 
 async def start_new_collection(update: Update, title: str, amount: int = 0):
-    families = get_families()
+    chat_id = update.effective_chat.id
+    families = get_families(chat_id)
     if not families:
         await update.message.reply_text(
             "⚠️ Сначала задайте список фамилий: /setfamilies"
         )
         return
-    cid = create_collection(title, families, amount)
+    cid = create_collection(chat_id, title, families, amount)
     listing = "\n".join(f"{i+1}. {f}" for i, f in enumerate(families))
     amount_line = f"\n💰 Сумма: *{amount} ₽* с человека\n" if amount else "\n"
     await update.message.reply_text(
@@ -454,16 +492,15 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_debtors(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает должников по всем сборам + общий итог по людям."""
-    debtors = get_all_debtors()
+    chat_id = update.effective_chat.id
+    debtors = get_all_debtors(chat_id)
     if not debtors:
         await update.message.reply_text("🎉 Должников нет — все сдали!")
         return
 
-    # Группируем по сборам
-    by_collection = {}   # (cid, title, amount) -> [families]
-    totals = {}          # family -> сумма долга
-    order = []           # порядок сборов
+    by_collection = {}
+    totals = {}
+    order = []
     for cid, title, amount, family in debtors:
         key = (cid, title, amount)
         if key not in by_collection:
@@ -473,7 +510,6 @@ async def show_debtors(update: Update, context: ContextTypes.DEFAULT_TYPE):
         totals[family] = totals.get(family, 0) + (amount or 0)
 
     lines = ["💸 *Список должников*\n"]
-    grand_total = 0
     for key in order:
         cid, title, amount = key
         fams = by_collection[key]
@@ -488,13 +524,10 @@ async def show_debtors(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines.append(f"   • {mention} — {money}")
             else:
                 lines.append(f"   • {f} — {money}")
-            if amount:
-                grand_total += amount
         lines.append("")
 
     lines.append("━━━━━━━━━━━━━━")
-    lines.append("📊 *Итого по людям (по всем сборам):*")
-    # сортируем по убыванию суммы
+    lines.append("📊 *Итого по людям (по всем сборам этого чата):*")
     for f, total in sorted(totals.items(), key=lambda x: (-x[1], x[0])):
         mention = format_mention(f)
         money = f"{total} ₽" if total else "—"
@@ -504,9 +537,6 @@ async def show_debtors(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"• {mention} — *{money}*")
         else:
             lines.append(f"• {f} — *{money}*")
-
-    lines.append("")
-    lines.append(f"💰 *Всего к сбору: {grand_total} ₽*")
 
     text = "\n".join(lines)
     for part in split_long(text):
@@ -519,9 +549,10 @@ async def cmd_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Только администратор.")
         return
-    cols = get_all_collections()
+    chat_id = update.effective_chat.id
+    cols = get_all_collections(chat_id)
     if not cols:
-        await update.message.reply_text("Сборов пока нет.")
+        await update.message.reply_text("Сборов в этом чате пока нет.")
         return
 
     blocks = []
@@ -546,6 +577,7 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Только администратор.")
         return
+    chat_id = update.effective_chat.id
     text = update.message.text or ""
     parts = text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
@@ -558,8 +590,9 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         SELECT c.id, c.title, c.active, c.amount, m.family, m.paid
         FROM members m
         JOIN collections c ON c.id = m.collection_id
+        WHERE c.chat_id = ?
         ORDER BY c.id
-    """).fetchall()
+    """, (chat_id,)).fetchall()
     conn.close()
 
     found = []
@@ -571,28 +604,25 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not found:
         await update.message.reply_text(
-            f"❌ Фамилия, содержащая «{query}», не найдена ни в одном сборе."
+            f"❌ Фамилия, содержащая «{query}», не найдена ни в одном сборе этого чата."
         )
         return
 
-    fams = get_families()
+    fams = get_families(chat_id)
     fams_match = [f for f in fams if query in f.lower()]
-    msg = "🔎 *Результаты поиска:*\n\n" + "\n".join(found)
+    msg = "🔎 *Результаты поиска (этот чат):*\n\n" + "\n".join(found)
     if fams_match:
-        msg += "\n\n📋 В общем списке фамилий: " + ", ".join(fams_match)
+        msg += "\n\n📋 В списке фамилий: " + ", ".join(fams_match)
     else:
-        msg += "\n\n📋 В общем списке фамилий совпадений нет."
+        msg += "\n\n📋 В списке фамилий совпадений нет."
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
 async def cmd_unpay(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Снять отметку об оплате (вернуть в должники).
-    /unpay Фамилия       — в активном сборе
-    /unpay Фамилия #N    — в конкретном сборе
-    """
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Только администратор.")
         return
+    chat_id = update.effective_chat.id
     text = update.message.text or ""
     parts = text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
@@ -614,15 +644,15 @@ async def cmd_unpay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cid = int(m.group(2))
 
     if cid is None:
-        active = get_active_collection()
+        active = get_active_collection(chat_id)
         if not active:
             await update.message.reply_text("Нет активного сбора.")
             return
         cid, title = active[0], active[1]
     else:
-        col = get_collection(cid)
+        col = get_collection(cid, chat_id)
         if not col:
-            await update.message.reply_text(f"⚠️ Сбор #{cid} не найден.")
+            await update.message.reply_text(f"⚠️ Сбор #{cid} не найден в этом чате.")
             return
         title = col[1]
 
@@ -642,10 +672,6 @@ async def cmd_unpay(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_setuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Привязать Telegram к фамилии.
-    /setuser Бамбаев @rubogent
-    /setuser Бамбаев   (ответом на сообщение человека)
-    """
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Только администратор.")
         return
@@ -723,6 +749,21 @@ async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_bindold(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Привязывает старые записи (chat_id=0) к текущему чату."""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Только администратор.")
+        return
+    chat_id = update.effective_chat.id
+    col_n, fam_n = bind_old_data_to_chat(chat_id)
+    await update.message.reply_text(
+        f"📦 Привязано к этому чату:\n"
+        f"• сборов: {col_n}\n"
+        f"• фамилий: {fam_n}\n\n"
+        f"Теперь они будут видны в этом чате и не попадут в другие."
+    )
+
+
 async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Только администратор.")
@@ -740,11 +781,12 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text = update.message.text.strip()
     lower = text.lower()
+    chat_id = update.effective_chat.id
 
     # 1) Список должников / сдавших
     if lower in ("список должников", "должники", "кто не сдал", "список сдавших"):
         if lower == "список сдавших":
-            active = get_active_collection()
+            active = get_active_collection(chat_id)
             if not active:
                 await update.message.reply_text("Нет активного сбора.")
                 return
@@ -759,7 +801,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_debtors(update, context)
         return
 
-    # 2) Новый сбор текстом (с суммой)
+    # 2) Новый сбор текстом
     m = re.match(r"^(?:новый\s+)?сбор\s+(.+)$", text, re.IGNORECASE)
     if m:
         if not is_admin(update.effective_user.id):
@@ -769,7 +811,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await start_new_collection(update, title, amount)
         return
 
-    # 3) «Фамилия скинул/оплатил/+» и опционально «#N»
+    # 3) «Фамилия скинул/оплатил/+»
     m = PAID_RE.match(text)
     if m:
         family = m.group(1)
@@ -780,9 +822,11 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save_contact(family.strip(), user.username, user.id, user.full_name)
 
         if explicit_cid:
-            col = get_collection(explicit_cid)
+            col = get_collection(explicit_cid, chat_id)
             if not col:
-                await update.message.reply_text(f"⚠️ Сбор #{explicit_cid} не найден.")
+                await update.message.reply_text(
+                    f"⚠️ Сбор #{explicit_cid} не найден в этом чате."
+                )
                 return
             status, name = mark_paid(explicit_cid, family)
             if status == "ok":
@@ -799,7 +843,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             return
 
-        active = get_active_collection()
+        active = get_active_collection(chat_id)
         if active:
             cid, title, amount = active
             status, name = mark_paid(cid, family)
@@ -814,7 +858,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
-        past = find_unpaid_in_past(family)
+        past = find_unpaid_in_past(chat_id, family)
         if len(past) == 1:
             pcid, ptitle, mid, pfam = past[0]
             status, name = mark_paid_by_member_id(mid)
@@ -842,7 +886,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             await update.message.reply_text(
-                f"⚠️ «{family}» не найден в прошлых сборах."
+                f"⚠️ «{family}» не найден в прошлых сборах этого чата."
             )
         return
 
@@ -864,6 +908,7 @@ def main():
     app.add_handler(CommandHandler("setuser", cmd_setuser))
     app.add_handler(CommandHandler("unsetuser", cmd_unsetuser))
     app.add_handler(CommandHandler("users", cmd_users))
+    app.add_handler(CommandHandler("bindold", cmd_bindold))
     app.add_handler(CommandHandler("restart", cmd_restart))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))

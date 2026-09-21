@@ -8,7 +8,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 
 # ============ НАСТРОЙКИ ============
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = [1920218354]
+ADMIN_IDS = [1920218354]   # ваш user_id
 DB_PATH = "collections.db"
 # ===================================
 
@@ -52,15 +52,12 @@ def init_db():
     )""")
 
     # --- МИГРАЦИИ для старых баз ---
-    # collections: добавить amount
     cols = [row[1] for row in c.execute("PRAGMA table_info(collections)").fetchall()]
     if "amount" not in cols:
         c.execute("ALTER TABLE collections ADD COLUMN amount INTEGER DEFAULT 0")
-    # collections: добавить chat_id
     if "chat_id" not in cols:
         c.execute("ALTER TABLE collections ADD COLUMN chat_id INTEGER DEFAULT 0")
 
-    # families: пересоздать таблицу с chat_id, если её нет
     fam_cols = [row[1] for row in c.execute("PRAGMA table_info(families)").fetchall()]
     if "chat_id" not in fam_cols:
         c.execute("ALTER TABLE families RENAME TO families_old")
@@ -263,8 +260,45 @@ def get_all_debtors(chat_id):
     return [(r[0], r[1], r[2] or 0, r[3]) for r in rows]
 
 
+def delete_collection(cid, chat_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    row = c.execute(
+        "SELECT id, title FROM collections WHERE id=? AND chat_id=?",
+        (cid, chat_id),
+    ).fetchone()
+    if not row:
+        conn.close()
+        return None
+    members_count = c.execute(
+        "SELECT COUNT(*) FROM members WHERE collection_id=?", (cid,)
+    ).fetchone()[0]
+    c.execute("DELETE FROM members WHERE collection_id=?", (cid,))
+    c.execute("DELETE FROM collections WHERE id=?", (cid,))
+    conn.commit()
+    conn.close()
+    return row[1], members_count
+
+
+def delete_all_collections(chat_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    ids = [r[0] for r in c.execute(
+        "SELECT id FROM collections WHERE chat_id=?", (chat_id,)
+    ).fetchall()]
+    if not ids:
+        conn.close()
+        return 0
+    qmarks = ",".join("?" * len(ids))
+    c.execute(f"DELETE FROM members WHERE collection_id IN ({qmarks})", ids)
+    c.execute("DELETE FROM collections WHERE chat_id=?", (chat_id,))
+    n = c.rowcount
+    conn.commit()
+    conn.close()
+    return n
+
+
 def bind_old_data_to_chat(chat_id):
-    """Привязывает старые записи (chat_id=0) к текущему чату."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("UPDATE collections SET chat_id=? WHERE chat_id=0", (chat_id,))
@@ -379,6 +413,8 @@ PAID_RE = re.compile(
     re.IGNORECASE,
 )
 
+_pending_clear = {}
+
 
 # ---------- Команды ----------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -391,15 +427,19 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/all — все сборы в этом чате\n"
         "/check <Фамилия> — где числится фамилия\n"
         "/unpay <Фамилия> [#N] — вернуть в должники\n"
+        "/delcollection #N — удалить сбор по номеру\n"
+        "/clearall — удалить все сборы в этом чате\n"
         "/setuser <Фамилия> [@username] — привязать Telegram\n"
         "/unsetuser <Фамилия> — удалить привязку\n"
         "/users — список привязок\n"
         "/bindold — привязать старые сборы к этому чату (одноразово)\n"
+        "/export_db — скачать файл базы данных (резервная копия)\n"
         "/restart — перезапустить бота\n\n"
         "*Для участников:*\n"
         "Напишите «Фамилия скинул» или «Фамилия +» — отмечу оплату.\n"
         "Можно указать прошлый сбор: «Фамилия + #2».\n\n"
-        "«Список должников» — покажу всех должников этого чата с итогами."
+        "«Список должников» — все сборы с итогами.\n"
+        "«Список должников #2» — только по сбору №2."
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -492,6 +532,7 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_debtors(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Общий список: все сборы + итоги по людям."""
     chat_id = update.effective_chat.id
     debtors = get_all_debtors(chat_id)
     if not debtors:
@@ -513,8 +554,13 @@ async def show_debtors(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for key in order:
         cid, title, amount = key
         fams = by_collection[key]
+        members = get_members(cid)
+        total_cnt = len(members)
+        paid_cnt = sum(1 for _, p in members if p)
         amount_str = f"по {amount} ₽" if amount else "сумма не указана"
-        lines.append(f"📌 *#{cid} «{title}»* _{amount_str}_")
+        lines.append(
+            f"📌 *#{cid} «{title}»* _{amount_str}_ — сдало *{paid_cnt}/{total_cnt}*"
+        )
         for f in fams:
             mention = format_mention(f)
             money = f"{amount} ₽" if amount else "—"
@@ -545,6 +591,72 @@ async def show_debtors(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def show_debtors_for_collection(update: Update, context: ContextTypes.DEFAULT_TYPE, cid: int):
+    """Должники по одному сбору."""
+    chat_id = update.effective_chat.id
+    col = get_collection(cid, chat_id)
+    if not col:
+        await update.message.reply_text(f"⚠️ Сбор #{cid} не найден в этом чате.")
+        return
+    _, title, amount = col
+    members = get_members(cid)
+    unpaid = [f for f, p in members if not p]
+    paid = [f for f, p in members if p]
+
+    header = f"💸 *Должники по сбору #{cid} «{title}»*"
+    if amount:
+        header += f"\n_Сумма: {amount} ₽ с человека_"
+    header += f"\n_Сдало: *{len(paid)}/{len(members)}*_\n"
+
+    if not unpaid:
+        await update.message.reply_text(
+            header + f"\n🎉 Все сдали! ({len(paid)}/{len(members)})",
+            parse_mode="Markdown",
+        )
+        return
+
+    lines = [header]
+    total_debt = 0
+    for i, f in enumerate(unpaid, 1):
+        mention = format_mention(f)
+        money = f"{amount} ₽" if amount else "—"
+        if mention.startswith("@"):
+            lines.append(f"{i}. {mention} ({f}) — {money}")
+        elif mention.startswith("["):
+            lines.append(f"{i}. {mention} — {money}")
+        else:
+            lines.append(f"{i}. {f} — {money}")
+        if amount:
+            total_debt += amount
+
+    if amount:
+        lines.append(f"\n💰 *Итого к сбору: {total_debt} ₽*")
+
+    lines.append(f"\n✅ Сдало: {len(paid)}/{len(members)}")
+    if paid:
+        lines.append(f"Список сдавших: {', '.join(paid)}")
+
+    text = "\n".join(lines)
+    for part in split_long(text):
+        await update.message.reply_text(
+            part, parse_mode="Markdown", disable_web_page_preview=True
+        )
+
+
+async def cmd_debtors(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text or ""
+    m = re.search(r"#?\s*(\d+)", text)
+    if not m:
+        await update.message.reply_text(
+            "Использование: `/debtors #2`\n"
+            "Номера сборов смотрите в `/all`.",
+            parse_mode="Markdown",
+        )
+        return
+    cid = int(m.group(1))
+    await show_debtors_for_collection(update, context, cid)
+
+
 async def cmd_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Только администратор.")
@@ -563,7 +675,7 @@ async def cmd_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         amount_str = f" • {col['amount']} ₽ с чел." if col["amount"] else ""
         b = f"*#{col['id']} — {col['title']}*\n"
         b += f"_Создан: {col['created_at']} • {status}{amount_str}_\n"
-        b += f"✅ Сдали ({len(paid)}/{len(col['members'])}): {', '.join(paid) or '—'}\n"
+        b += f"✅ Сдало ({len(paid)}/{len(col['members'])}): {', '.join(paid) or '—'}\n"
         if unpaid:
             b += f"❌ Должники ({len(unpaid)}): {', '.join(unpaid)}"
         blocks.append(b)
@@ -671,6 +783,56 @@ async def cmd_unpay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def cmd_delcollection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Только администратор.")
+        return
+    chat_id = update.effective_chat.id
+    text = update.message.text or ""
+    m = re.search(r"#?\s*(\d+)", text)
+    if not m:
+        await update.message.reply_text(
+            "Использование: `/delcollection #2`\n\n"
+            "Номер сбора смотрите в `/all`.",
+            parse_mode="Markdown",
+        )
+        return
+    cid = int(m.group(1))
+    res = delete_collection(cid, chat_id)
+    if not res:
+        await update.message.reply_text(f"⚠️ Сбор #{cid} не найден в этом чате.")
+        return
+    title, members_count = res
+    await update.message.reply_text(
+        f"🗑 Сбор *#{cid} «{title}»* удалён.\n"
+        f"Вместе с ним удалено участников: {members_count}.\n\n"
+        f"Остальные сборы не затронуты.",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_clearall(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Только администратор.")
+        return
+    chat_id = update.effective_chat.id
+    cols = get_all_collections(chat_id)
+    if not cols:
+        await update.message.reply_text("В этом чате нет сборов.")
+        return
+
+    _pending_clear[chat_id] = True
+    listing = "\n".join(f"• #{c['id']} — {c['title']}" for c in cols)
+    await update.message.reply_text(
+        f"⚠️ *Удалить ВСЕ сборы в этом чате?*\n\n"
+        f"{listing}\n\n"
+        f"Будет удалено: *{len(cols)}* сбора/сборов.\n"
+        f"Список фамилий (`/families`) останется.\n\n"
+        f"Напишите *`да`* для подтверждения или что угодно другое для отмены.",
+        parse_mode="Markdown",
+    )
+
+
 async def cmd_setuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Только администратор.")
@@ -750,7 +912,6 @@ async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_bindold(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Привязывает старые записи (chat_id=0) к текущему чату."""
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Только администратор.")
         return
@@ -762,6 +923,30 @@ async def cmd_bindold(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• фамилий: {fam_n}\n\n"
         f"Теперь они будут видны в этом чате и не попадут в другие."
     )
+
+
+async def cmd_export_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Только администратор.")
+        return
+    if not os.path.exists(DB_PATH):
+        await update.message.reply_text("⚠️ Файл базы не найден на сервере.")
+        return
+    size = os.path.getsize(DB_PATH)
+    await update.message.reply_text(
+        f"📦 Отправляю файл базы данных...\n"
+        f"Размер: {size} байт\n\n"
+        f"Сохраните его — это резервная копия всех сборов, фамилий и привязок."
+    )
+    try:
+        with open(DB_PATH, "rb") as f:
+            await update.message.reply_document(
+                document=f,
+                filename="collections_backup.db",
+                caption="💾 Резервная копия базы данных бота",
+            )
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Ошибка при отправке файла: {e}")
 
 
 async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -783,7 +968,30 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lower = text.lower()
     chat_id = update.effective_chat.id
 
-    # 1) Список должников / сдавших
+    # 0) Подтверждение удаления всех сборов
+    if _pending_clear.get(chat_id):
+        del _pending_clear[chat_id]
+        if lower == "да":
+            if not is_admin(update.effective_user.id):
+                await update.message.reply_text("⛔ Только администратор.")
+                return
+            n = delete_all_collections(chat_id)
+            await update.message.reply_text(
+                f"🗑 Удалено сборов: *{n}*.\nСписок фамилий не тронут — `/families`.",
+                parse_mode="Markdown",
+            )
+        else:
+            await update.message.reply_text("❌ Отменено. Ничего не удалено.")
+        return
+
+    # 1) Список должников #N — только по одному сбору
+    m_dd = re.match(r"^(?:список\s+должников|должники|кто\s+не\s+сдал)\s*#?\s*(\d+)\s*$", lower)
+    if m_dd:
+        cid = int(m_dd.group(1))
+        await show_debtors_for_collection(update, context, cid)
+        return
+
+    # 2) Список должников / сдавших — общий
     if lower in ("список должников", "должники", "кто не сдал", "список сдавших"):
         if lower == "список сдавших":
             active = get_active_collection(chat_id)
@@ -801,7 +1009,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_debtors(update, context)
         return
 
-    # 2) Новый сбор текстом
+    # 3) Новый сбор текстом
     m = re.match(r"^(?:новый\s+)?сбор\s+(.+)$", text, re.IGNORECASE)
     if m:
         if not is_admin(update.effective_user.id):
@@ -811,7 +1019,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await start_new_collection(update, title, amount)
         return
 
-    # 3) «Фамилия скинул/оплатил/+»
+    # 4) «Фамилия скинул/оплатил/+»
     m = PAID_RE.match(text)
     if m:
         family = m.group(1)
@@ -904,11 +1112,15 @@ def main():
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("all", cmd_all))
     app.add_handler(CommandHandler("check", cmd_check))
+    app.add_handler(CommandHandler("debtors", cmd_debtors))
     app.add_handler(CommandHandler("unpay", cmd_unpay))
+    app.add_handler(CommandHandler("delcollection", cmd_delcollection))
+    app.add_handler(CommandHandler("clearall", cmd_clearall))
     app.add_handler(CommandHandler("setuser", cmd_setuser))
     app.add_handler(CommandHandler("unsetuser", cmd_unsetuser))
     app.add_handler(CommandHandler("users", cmd_users))
     app.add_handler(CommandHandler("bindold", cmd_bindold))
+    app.add_handler(CommandHandler("export_db", cmd_export_db))
     app.add_handler(CommandHandler("restart", cmd_restart))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))

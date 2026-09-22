@@ -3,6 +3,7 @@ import logging
 import re
 import os
 import sys
+import asyncio
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -10,12 +11,32 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = [1920218354]   # ваш user_id
 DB_PATH = "collections.db"
+
+# Автоудаление коротких подтверждений (в секундах). 0 — выключить.
+AUTO_DELETE_SECONDS = 15
 # ===================================
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
     level=logging.INFO,
 )
+
+
+# ---------- Автоудаление ----------
+async def delete_later(message, seconds: int = AUTO_DELETE_SECONDS):
+    if not seconds or seconds <= 0:
+        return
+    try:
+        await asyncio.sleep(seconds)
+        await message.delete()
+    except Exception:
+        pass
+
+
+async def reply_auto(update: Update, text: str, **kwargs):
+    msg = await update.message.reply_text(text, **kwargs)
+    asyncio.create_task(delete_later(msg, AUTO_DELETE_SECONDS))
+    return msg
 
 
 # ---------- БД ----------
@@ -44,14 +65,7 @@ def init_db():
         name TEXT NOT NULL,
         UNIQUE(chat_id, name)
     )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS family_contacts (
-        family TEXT UNIQUE NOT NULL,
-        username TEXT,
-        user_id INTEGER,
-        full_name TEXT
-    )""")
 
-    # --- МИГРАЦИИ для старых баз ---
     cols = [row[1] for row in c.execute("PRAGMA table_info(collections)").fetchall()]
     if "amount" not in cols:
         c.execute("ALTER TABLE collections ADD COLUMN amount INTEGER DEFAULT 0")
@@ -310,61 +324,55 @@ def bind_old_data_to_chat(chat_id):
     return col_n, fam_n
 
 
-# ---------- Контакты ----------
-def save_contact(family, username, user_id, full_name):
+def transfer_data(from_chat_id, to_chat_id):
+    """Переносит сборы и фамилии из одного чата в другой (с удалением в источнике)."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("""
-        INSERT INTO family_contacts (family, username, user_id, full_name)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(family) DO UPDATE SET
-            username=excluded.username,
-            user_id=excluded.user_id,
-            full_name=excluded.full_name
-    """, (family, username, user_id, full_name))
-    conn.commit()
-    conn.close()
 
-
-def get_contact(family):
-    conn = sqlite3.connect(DB_PATH)
-    row = conn.execute(
-        "SELECT username, user_id, full_name FROM family_contacts WHERE LOWER(family)=LOWER(?)",
-        (family,),
-    ).fetchone()
-    conn.close()
-    return row
-
-
-def get_all_contacts():
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute(
-        "SELECT family, username, user_id, full_name FROM family_contacts ORDER BY family"
+    cols = c.execute(
+        "SELECT id, title, created_at, active, amount FROM collections WHERE chat_id=?",
+        (from_chat_id,),
     ).fetchall()
-    conn.close()
-    return rows
+    col_count = 0
+    for cid, title, created_at, active, amount in cols:
+        c.execute(
+            "INSERT INTO collections (title, created_at, active, amount, chat_id) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (title, created_at, active, amount, to_chat_id),
+        )
+        new_cid = c.lastrowid
+        c.execute("""
+            INSERT INTO members (collection_id, family, paid, paid_at)
+            SELECT ?, family, paid, paid_at FROM members WHERE collection_id=?
+        """, (new_cid, cid))
+        col_count += 1
 
+    old_ids = [r[0] for r in cols]
+    if old_ids:
+        qmarks = ",".join("?" * len(old_ids))
+        c.execute(f"DELETE FROM members WHERE collection_id IN ({qmarks})", old_ids)
+        c.execute("DELETE FROM collections WHERE chat_id=?", (from_chat_id,))
 
-def delete_contact(family):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("DELETE FROM family_contacts WHERE LOWER(family)=LOWER(?)", (family,))
-    deleted = c.rowcount > 0
+    fams = c.execute(
+        "SELECT name FROM families WHERE chat_id=?", (from_chat_id,)
+    ).fetchall()
+    fam_count = 0
+    for (name,) in fams:
+        existing = c.execute(
+            "SELECT 1 FROM families WHERE chat_id=? AND LOWER(name)=LOWER(?)",
+            (to_chat_id, name),
+        ).fetchone()
+        if not existing:
+            c.execute(
+                "INSERT INTO families (chat_id, name) VALUES (?, ?)",
+                (to_chat_id, name),
+            )
+            fam_count += 1
+    c.execute("DELETE FROM families WHERE chat_id=?", (from_chat_id,))
+
     conn.commit()
     conn.close()
-    return deleted
-
-
-def format_mention(family):
-    contact = get_contact(family)
-    if not contact:
-        return family
-    username, user_id, full_name = contact
-    if username:
-        return f"@{username}"
-    if user_id:
-        return f"[{family}](tg://user?id={user_id})"
-    return family
+    return col_count, fam_count
 
 
 # ---------- Утилиты ----------
@@ -406,12 +414,32 @@ def parse_new_collection_text(body):
     return body, 0
 
 
-PAID_RE = re.compile(
+# --- Разбор отметки об оплате ---
+# Каждая запись ОБЯЗАТЕЛЬНО содержит маркер: +, скинул, оплатил, перевёл, отправил, заплатил
+PAID_ITEM_RE = re.compile(
     r"^\s*([А-ЯЁA-Zа-яёa-z][А-ЯЁA-Zа-яёa-z\-']{1,40})\s*"
-    r"(скинул[аи]?|оплатил[а]?|перев[её]л[а]?|отправил[а]?|заплатил[а]?|\+)"
+    r"(?:\+|\s+(?:скинул[аи]?|оплатил[а]?|перев[её]л[а]?|отправил[а]?|заплатил[а]?))"
     r"(?:\s*(?:в\s+сборе|сборе|#)\s*(\d+))?\s*$",
     re.IGNORECASE,
 )
+
+
+def parse_paid_message(text):
+    if not text or not text.strip():
+        return []
+    results = []
+    raw_parts = re.split(r"[\n,;]+", text)
+    for p in raw_parts:
+        p = p.strip()
+        if not p:
+            continue
+        m = PAID_ITEM_RE.match(p)
+        if m:
+            family = m.group(1).strip()
+            cid = int(m.group(2)) if m.group(2) else None
+            results.append((family, cid))
+    return results
+
 
 _pending_clear = {}
 
@@ -429,14 +457,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/unpay <Фамилия> [#N] — вернуть в должники\n"
         "/delcollection #N — удалить сбор по номеру\n"
         "/clearall — удалить все сборы в этом чате\n"
-        "/setuser <Фамилия> [@username] — привязать Telegram\n"
-        "/unsetuser <Фамилия> — удалить привязку\n"
-        "/users — список привязок\n"
-        "/bindold — привязать старые сборы к этому чату (одноразово)\n"
-        "/export_db — скачать файл базы данных (резервная копия)\n"
+        "/bindold — привязать старые сборы к этому чату\n"
+        "/transfer_to <chat_id> — перенести сборы в другой чат\n"
+        "/export_db — скачать файл базы данных\n"
         "/restart — перезапустить бота\n\n"
         "*Для участников:*\n"
-        "Напишите «Фамилия скинул» или «Фамилия +» — отмечу оплату.\n"
+        "Напишите «Фамилия+», «Фамилия скинул», «Фамилия оплатил» — отмечу оплату.\n"
+        "Можно сразу несколько:\n"
+        "`Егай+`\n`Балакин+`\n`Бойков скинул`\n\n"
         "Можно указать прошлый сбор: «Фамилия + #2».\n\n"
         "«Список должников» — все сборы с итогами.\n"
         "«Список должников #2» — только по сбору №2."
@@ -446,14 +474,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        f"Ваш user_id: `{update.effective_user.id}`\nChat id: `{update.effective_chat.id}`",
+        f"Ваш user_id: `{update.effective_user.id}`\n"
+        f"Chat id: `{update.effective_chat.id}`\n"
+        f"Тип чата: `{update.effective_chat.type}`",
         parse_mode="Markdown",
     )
 
 
 async def cmd_setfamilies(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Только администратор может менять список.")
+        await reply_auto(update, "⛔ Только администратор может менять список.")
         return
     chat_id = update.effective_chat.id
     text = update.message.text or ""
@@ -479,9 +509,7 @@ async def cmd_setfamilies(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     set_families(chat_id, unique)
-    await update.message.reply_text(
-        f"✅ Сохранено {len(unique)} фамилий для этого чата:\n" + ", ".join(unique)
-    )
+    await reply_auto(update, f"✅ Сохранено {len(unique)} фамилий:\n" + ", ".join(unique))
 
 
 async def cmd_families(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -507,14 +535,14 @@ async def start_new_collection(update: Update, title: str, amount: int = 0):
     await update.message.reply_text(
         f"📢 *Новый сбор #{cid}:* {title}\n{amount_line}\n"
         f"👥 Кто участвует:\n{listing}\n\n"
-        f"Когда сдадите — напишите «Фамилия скинул» или «Фамилия +».",
+        f"Когда сдадите — напишите «Фамилия+» или «Фамилия скинул».",
         parse_mode="Markdown",
     )
 
 
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Только администратор может создавать сборы.")
+        await reply_auto(update, "⛔ Только администратор может создавать сборы.")
         return
     text = update.message.text or ""
     parts = text.split(maxsplit=1)
@@ -562,33 +590,19 @@ async def show_debtors(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📌 *#{cid} «{title}»* _{amount_str}_ — сдало *{paid_cnt}/{total_cnt}*"
         )
         for f in fams:
-            mention = format_mention(f)
             money = f"{amount} ₽" if amount else "—"
-            if mention.startswith("@"):
-                lines.append(f"   • {mention} ({f}) — {money}")
-            elif mention.startswith("["):
-                lines.append(f"   • {mention} — {money}")
-            else:
-                lines.append(f"   • {f} — {money}")
+            lines.append(f"   • {f} — {money}")
         lines.append("")
 
     lines.append("━━━━━━━━━━━━━━")
     lines.append("📊 *Итого по людям (по всем сборам этого чата):*")
     for f, total in sorted(totals.items(), key=lambda x: (-x[1], x[0])):
-        mention = format_mention(f)
         money = f"{total} ₽" if total else "—"
-        if mention.startswith("@"):
-            lines.append(f"• {mention} ({f}) — *{money}*")
-        elif mention.startswith("["):
-            lines.append(f"• {mention} — *{money}*")
-        else:
-            lines.append(f"• {f} — *{money}*")
+        lines.append(f"• {f} — *{money}*")
 
     text = "\n".join(lines)
     for part in split_long(text):
-        await update.message.reply_text(
-            part, parse_mode="Markdown", disable_web_page_preview=True
-        )
+        await update.message.reply_text(part, parse_mode="Markdown")
 
 
 async def show_debtors_for_collection(update: Update, context: ContextTypes.DEFAULT_TYPE, cid: int):
@@ -618,14 +632,8 @@ async def show_debtors_for_collection(update: Update, context: ContextTypes.DEFA
     lines = [header]
     total_debt = 0
     for i, f in enumerate(unpaid, 1):
-        mention = format_mention(f)
         money = f"{amount} ₽" if amount else "—"
-        if mention.startswith("@"):
-            lines.append(f"{i}. {mention} ({f}) — {money}")
-        elif mention.startswith("["):
-            lines.append(f"{i}. {mention} — {money}")
-        else:
-            lines.append(f"{i}. {f} — {money}")
+        lines.append(f"{i}. {f} — {money}")
         if amount:
             total_debt += amount
 
@@ -638,9 +646,7 @@ async def show_debtors_for_collection(update: Update, context: ContextTypes.DEFA
 
     text = "\n".join(lines)
     for part in split_long(text):
-        await update.message.reply_text(
-            part, parse_mode="Markdown", disable_web_page_preview=True
-        )
+        await update.message.reply_text(part, parse_mode="Markdown")
 
 
 async def cmd_debtors(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -648,8 +654,7 @@ async def cmd_debtors(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = re.search(r"#?\s*(\d+)", text)
     if not m:
         await update.message.reply_text(
-            "Использование: `/debtors #2`\n"
-            "Номера сборов смотрите в `/all`.",
+            "Использование: `/debtors #2`\nНомера сборов смотрите в `/all`.",
             parse_mode="Markdown",
         )
         return
@@ -659,12 +664,12 @@ async def cmd_debtors(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Только администратор.")
+        await reply_auto(update, "⛔ Только администратор.")
         return
     chat_id = update.effective_chat.id
     cols = get_all_collections(chat_id)
     if not cols:
-        await update.message.reply_text("Сборов в этом чате пока нет.")
+        await reply_auto(update, "Сборов в этом чате пока нет.")
         return
 
     blocks = []
@@ -687,13 +692,13 @@ async def cmd_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Только администратор.")
+        await reply_auto(update, "⛔ Только администратор.")
         return
     chat_id = update.effective_chat.id
     text = update.message.text or ""
     parts = text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
-        await update.message.reply_text("Использование: /check <Фамилия>")
+        await reply_auto(update, "Использование: /check <Фамилия>")
         return
     query = parts[1].strip().lower()
 
@@ -715,14 +720,15 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
             found.append(f"• #{cid} «{title}» ({status}) — {fam}: {mark}")
 
     if not found:
-        await update.message.reply_text(
-            f"❌ Фамилия, содержащая «{query}», не найдена ни в одном сборе этого чата."
+        await reply_auto(
+            update,
+            f"❌ Фамилия, содержащая «{query}», не найдена ни в одном сборе."
         )
         return
 
     fams = get_families(chat_id)
     fams_match = [f for f in fams if query in f.lower()]
-    msg = "🔎 *Результаты поиска (этот чат):*\n\n" + "\n".join(found)
+    msg = "🔎 *Результаты поиска:*\n\n" + "\n".join(found)
     if fams_match:
         msg += "\n\n📋 В списке фамилий: " + ", ".join(fams_match)
     else:
@@ -732,7 +738,7 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_unpay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Только администратор.")
+        await reply_auto(update, "⛔ Только администратор.")
         return
     chat_id = update.effective_chat.id
     text = update.message.text or ""
@@ -758,67 +764,55 @@ async def cmd_unpay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if cid is None:
         active = get_active_collection(chat_id)
         if not active:
-            await update.message.reply_text("Нет активного сбора.")
+            await reply_auto(update, "Нет активного сбора.")
             return
         cid, title = active[0], active[1]
     else:
         col = get_collection(cid, chat_id)
         if not col:
-            await update.message.reply_text(f"⚠️ Сбор #{cid} не найден в этом чате.")
+            await reply_auto(update, f"⚠️ Сбор #{cid} не найден.")
             return
         title = col[1]
 
     status, name = unmark_paid(cid, family)
     if status == "ok":
-        await update.message.reply_text(
-            f"↩️ {name} возвращён в должники по сбору «{title}» (#{cid})."
-        )
+        await reply_auto(update, f"↩️ {name} возвращён в должники по «{title}» (#{cid}).")
     elif status == "already_unpaid":
-        await update.message.reply_text(
-            f"ℹ️ «{name}» и так числится в должниках по сбору «{title}»."
-        )
+        await reply_auto(update, f"ℹ️ «{name}» и так в должниках по «{title}».")
     else:
-        await update.message.reply_text(
-            f"⚠️ «{family}» не найден в сборе «{title}»."
-        )
+        await reply_auto(update, f"⚠️ «{family}» не найден в сборе «{title}».")
 
 
 async def cmd_delcollection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Только администратор.")
+        await reply_auto(update, "⛔ Только администратор.")
         return
     chat_id = update.effective_chat.id
     text = update.message.text or ""
     m = re.search(r"#?\s*(\d+)", text)
     if not m:
-        await update.message.reply_text(
-            "Использование: `/delcollection #2`\n\n"
-            "Номер сбора смотрите в `/all`.",
-            parse_mode="Markdown",
-        )
+        await reply_auto(update, "Использование: /delcollection #2")
         return
     cid = int(m.group(1))
     res = delete_collection(cid, chat_id)
     if not res:
-        await update.message.reply_text(f"⚠️ Сбор #{cid} не найден в этом чате.")
+        await reply_auto(update, f"⚠️ Сбор #{cid} не найден.")
         return
     title, members_count = res
-    await update.message.reply_text(
-        f"🗑 Сбор *#{cid} «{title}»* удалён.\n"
-        f"Вместе с ним удалено участников: {members_count}.\n\n"
-        f"Остальные сборы не затронуты.",
-        parse_mode="Markdown",
+    await reply_auto(
+        update,
+        f"🗑 Сбор #{cid} «{title}» удалён ({members_count} участников)."
     )
 
 
 async def cmd_clearall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Только администратор.")
+        await reply_auto(update, "⛔ Только администратор.")
         return
     chat_id = update.effective_chat.id
     cols = get_all_collections(chat_id)
     if not cols:
-        await update.message.reply_text("В этом чате нет сборов.")
+        await reply_auto(update, "В этом чате нет сборов.")
         return
 
     _pending_clear[chat_id] = True
@@ -833,110 +827,68 @@ async def cmd_clearall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def cmd_setuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Только администратор.")
-        return
-
-    text = update.message.text or ""
-    parts = text.split(maxsplit=2)
-    if len(parts) < 2:
-        await update.message.reply_text(
-            "Использование:\n"
-            "• `/setuser Бамбаев @rubogent` — по @username\n"
-            "• ответом на сообщение человека: `/setuser Бамбаев`",
-            parse_mode="Markdown",
-        )
-        return
-
-    family = parts[1].strip()
-
-    if update.message.reply_to_message and update.message.reply_to_message.from_user:
-        u = update.message.reply_to_message.from_user
-        save_contact(family, u.username, u.id, u.full_name)
-        await update.message.reply_text(
-            f"✅ Фамилия «{family}» привязана к {u.full_name}"
-            + (f" (@{u.username})" if u.username else "")
-        )
-        return
-
-    if len(parts) < 3:
-        await update.message.reply_text(
-            "⚠️ Укажите @username или ответьте на сообщение человека."
-        )
-        return
-
-    username = parts[2].strip().lstrip("@")
-    save_contact(family, username, None, None)
-    await update.message.reply_text(f"✅ Фамилия «{family}» привязана к @{username}")
-
-
-async def cmd_unsetuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Только администратор.")
-        return
-    parts = (update.message.text or "").split(maxsplit=1)
-    if len(parts) < 2:
-        await update.message.reply_text("Использование: /unsetuser Бамбаев")
-        return
-    family = parts[1].strip()
-    if delete_contact(family):
-        await update.message.reply_text(f"🗑 Привязка для «{family}» удалена.")
-    else:
-        await update.message.reply_text(f"⚠️ Для «{family}» привязки не было.")
-
-
-async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Только администратор.")
-        return
-    contacts = get_all_contacts()
-    if not contacts:
-        await update.message.reply_text(
-            "Пока нет ни одной привязки.\n"
-            "Как только кто-то напишет «Фамилия скинул», бот запомнит его аккаунт."
-        )
-        return
-    lines = []
-    for fam, username, user_id, full_name in contacts:
-        if username:
-            lines.append(f"• {fam} → @{username}")
-        elif user_id:
-            lines.append(f"• {fam} → {full_name or 'без username'} (id {user_id})")
-        else:
-            lines.append(f"• {fam} → (нет данных)")
-    await update.message.reply_text(
-        "🔗 *Привязки фамилий к Telegram:*\n\n" + "\n".join(lines),
-        parse_mode="Markdown",
-    )
-
-
 async def cmd_bindold(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Только администратор.")
+        await reply_auto(update, "⛔ Только администратор.")
         return
     chat_id = update.effective_chat.id
     col_n, fam_n = bind_old_data_to_chat(chat_id)
-    await update.message.reply_text(
-        f"📦 Привязано к этому чату:\n"
+    await reply_auto(
+        update,
+        f"📦 Привязано к чату: сборов — {col_n}, фамилий — {fam_n}."
+    )
+
+
+async def cmd_transfer_to(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await reply_auto(update, "⛔ Только администратор.")
+        return
+    text = update.message.text or ""
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await update.message.reply_text(
+            "Использование: `/transfer_to <chat_id>`\n\n"
+            "Пример: `/transfer_to -1001234567890`\n\n"
+            "Узнать chat_id группы: отправьте в ней `/id`.",
+            parse_mode="Markdown",
+        )
+        return
+    try:
+        to_chat_id = int(parts[1].strip())
+    except ValueError:
+        await reply_auto(update, "⚠️ chat_id должен быть числом, например -1001234567890.")
+        return
+
+    from_chat_id = update.effective_chat.id
+    if from_chat_id == to_chat_id:
+        await reply_auto(update, "⚠️ Это тот же самый чат.")
+        return
+
+    col_n, fam_n = transfer_data(from_chat_id, to_chat_id)
+    if col_n == 0 and fam_n == 0:
+        await reply_auto(update, "⚠️ В этом чате нечего переносить.")
+        return
+
+    await reply_auto(
+        update,
+        f"📦 Перенесено в чат `{to_chat_id}`:\n"
         f"• сборов: {col_n}\n"
         f"• фамилий: {fam_n}\n\n"
-        f"Теперь они будут видны в этом чате и не попадут в другие."
+        f"Проверьте командой `/all` в целевом чате.",
+        parse_mode="Markdown",
     )
 
 
 async def cmd_export_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Только администратор.")
+        await reply_auto(update, "⛔ Только администратор.")
         return
     if not os.path.exists(DB_PATH):
-        await update.message.reply_text("⚠️ Файл базы не найден на сервере.")
+        await reply_auto(update, "⚠️ Файл базы не найден.")
         return
     size = os.path.getsize(DB_PATH)
     await update.message.reply_text(
-        f"📦 Отправляю файл базы данных...\n"
-        f"Размер: {size} байт\n\n"
-        f"Сохраните его — это резервная копия всех сборов, фамилий и привязок."
+        f"📦 Отправляю файл базы данных...\nРазмер: {size} байт."
     )
     try:
         with open(DB_PATH, "rb") as f:
@@ -946,14 +898,14 @@ async def cmd_export_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 caption="💾 Резервная копия базы данных бота",
             )
     except Exception as e:
-        await update.message.reply_text(f"⚠️ Ошибка при отправке файла: {e}")
+        await reply_auto(update, f"⚠️ Ошибка: {e}")
 
 
 async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Только администратор.")
+        await reply_auto(update, "⛔ Только администратор.")
         return
-    await update.message.reply_text("🔄 Перезапускаю бота... Через 5–15 секунд снова будет в строю.")
+    await update.message.reply_text("🔄 Перезапускаю бота...")
     logging.info("Bot restart requested by admin")
     sys.stdout.flush()
     sys.stderr.flush()
@@ -973,18 +925,15 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         del _pending_clear[chat_id]
         if lower == "да":
             if not is_admin(update.effective_user.id):
-                await update.message.reply_text("⛔ Только администратор.")
+                await reply_auto(update, "⛔ Только администратор.")
                 return
             n = delete_all_collections(chat_id)
-            await update.message.reply_text(
-                f"🗑 Удалено сборов: *{n}*.\nСписок фамилий не тронут — `/families`.",
-                parse_mode="Markdown",
-            )
+            await reply_auto(update, f"🗑 Удалено сборов: {n}. Фамилии не тронуты.")
         else:
-            await update.message.reply_text("❌ Отменено. Ничего не удалено.")
+            await reply_auto(update, "❌ Отменено.")
         return
 
-    # 1) Список должников #N — только по одному сбору
+    # 1) Список должников #N — по одному сбору
     m_dd = re.match(r"^(?:список\s+должников|должники|кто\s+не\s+сдал)\s*#?\s*(\d+)\s*$", lower)
     if m_dd:
         cid = int(m_dd.group(1))
@@ -996,7 +945,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if lower == "список сдавших":
             active = get_active_collection(chat_id)
             if not active:
-                await update.message.reply_text("Нет активного сбора.")
+                await reply_auto(update, "Нет активного сбора.")
                 return
             cid, title, amount = active
             paid = [f for f, p in get_members(cid) if p]
@@ -1013,89 +962,125 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = re.match(r"^(?:новый\s+)?сбор\s+(.+)$", text, re.IGNORECASE)
     if m:
         if not is_admin(update.effective_user.id):
-            await update.message.reply_text("⛔ Только администратор может создавать сборы.")
+            await reply_auto(update, "⛔ Только администратор может создавать сборы.")
             return
         title, amount = parse_new_collection_text(m.group(1).strip())
         await start_new_collection(update, title, amount)
         return
 
-    # 4) «Фамилия скинул/оплатил/+»
-    m = PAID_RE.match(text)
-    if m:
-        family = m.group(1)
-        explicit_cid = int(m.group(3)) if m.group(3) else None
+    # 4) Отметка оплаты — одна или несколько фамилий (только с маркером!)
+    paid_items = parse_paid_message(text)
+    if paid_items:
+        # Одиночный вариант
+        if len(paid_items) == 1:
+            family, explicit_cid = paid_items[0]
 
-        user = update.effective_user
-        if user:
-            save_contact(family.strip(), user.username, user.id, user.full_name)
+            if explicit_cid:
+                col = get_collection(explicit_cid, chat_id)
+                if not col:
+                    await reply_auto(update, f"⚠️ Сбор #{explicit_cid} не найден.")
+                    return
+                status, name = mark_paid(explicit_cid, family)
+                if status == "ok":
+                    await reply_auto(update, f"✅ {name} — оплата отмечена (#{explicit_cid}).")
+                elif status == "already":
+                    await reply_auto(update, f"ℹ️ {name} уже отмечен (#{explicit_cid}).")
+                else:
+                    await reply_auto(update, f"⚠️ «{family}» не найден в сборе #{explicit_cid}.")
+                return
 
-        if explicit_cid:
-            col = get_collection(explicit_cid, chat_id)
-            if not col:
-                await update.message.reply_text(
-                    f"⚠️ Сбор #{explicit_cid} не найден в этом чате."
+            active = get_active_collection(chat_id)
+            if active:
+                cid, title, amount = active
+                status, name = mark_paid(cid, family)
+                if status == "ok":
+                    await reply_auto(update, f"✅ {name} — оплата отмечена по «{title}».")
+                    return
+                if status == "already":
+                    await reply_auto(update, f"ℹ️ {name} уже отмечен по «{title}».")
+                    return
+
+            past = find_unpaid_in_past(chat_id, family)
+            if len(past) == 1:
+                pcid, ptitle, mid, pfam = past[0]
+                status, name = mark_paid_by_member_id(mid)
+                if status == "ok":
+                    await reply_auto(update, f"✅ {name} — оплата отмечена в прошлом сборе «{ptitle}».")
+                else:
+                    await reply_auto(update, f"ℹ️ {name} уже отмечен по «{ptitle}».")
+                return
+            if len(past) > 1:
+                listing = "\n".join(f"• #{c} — {t}" for c, t, _, _ in past)
+                await reply_auto(
+                    update,
+                    f"⚠️ Несколько прошлых сборов с «{family}»:\n{listing}\n"
+                    f"Уточните: «{family} + #{past[0][0]}»"
                 )
                 return
-            status, name = mark_paid(explicit_cid, family)
-            if status == "ok":
-                await update.message.reply_text(
-                    f"✅ {name} — оплата отмечена по сбору «{col[1]}» (#{explicit_cid})."
-                )
-            elif status == "already":
-                await update.message.reply_text(
-                    f"ℹ️ {name} уже отмечен как оплативший по сбору «{col[1]}»."
+
+            if active:
+                await reply_auto(
+                    update,
+                    f"⚠️ «{family}» не найден в текущем сборе и в прошлых. "
+                    f"Проверьте написание или /check."
                 )
             else:
-                await update.message.reply_text(
-                    f"⚠️ «{family}» не найден в сборе «{col[1]}»."
-                )
+                await reply_auto(update, f"⚠️ «{family}» не найден в прошлых сборах.")
             return
 
+        # --- Массовый вариант ---
         active = get_active_collection(chat_id)
-        if active:
-            cid, title, amount = active
-            status, name = mark_paid(cid, family)
-            if status == "ok":
-                await update.message.reply_text(
-                    f"✅ {name} — оплата отмечена по сбору «{title}»."
-                )
-                return
-            if status == "already":
-                await update.message.reply_text(
-                    f"ℹ️ {name} уже отмечен как оплативший по сбору «{title}»."
-                )
-                return
+        explicit_cids = {cid for _, cid in paid_items if cid}
+        target_cid = None
+        target_title = None
+        if not explicit_cids and active:
+            target_cid, target_title = active[0], active[1]
 
-        past = find_unpaid_in_past(chat_id, family)
-        if len(past) == 1:
-            pcid, ptitle, mid, pfam = past[0]
-            status, name = mark_paid_by_member_id(mid)
-            if status == "ok":
-                await update.message.reply_text(
-                    f"✅ {name} — оплата отмечена по прошлому сбору «{ptitle}» (#{pcid})."
-                )
+        ok_list, already_list, notfound_list, past_multi = [], [], [], []
+
+        for fam, cid in paid_items:
+            if cid:
+                col = get_collection(cid, chat_id)
+                if not col:
+                    notfound_list.append(f"{fam} (#{cid} не найден)")
+                    continue
+                status, name = mark_paid(cid, fam)
+            elif target_cid:
+                status, name = mark_paid(target_cid, fam)
             else:
-                await update.message.reply_text(
-                    f"ℹ️ {name} уже отмечен по сбору «{ptitle}»."
-                )
-            return
-        if len(past) > 1:
-            listing = "\n".join(f"• #{c} — {t}" for c, t, _, _ in past)
-            await update.message.reply_text(
-                f"⚠️ Найдено несколько прошлых сборов с «{family}»:\n{listing}\n\n"
-                f"Уточните, например: «{family} + #{past[0][0]}»"
-            )
-            return
+                past = find_unpaid_in_past(chat_id, fam)
+                if len(past) == 1:
+                    _, _, mid, _ = past[0]
+                    status, name = mark_paid_by_member_id(mid)
+                elif len(past) > 1:
+                    past_multi.append(fam)
+                    continue
+                else:
+                    status, name = "not_found", None
 
-        if active:
-            await update.message.reply_text(
-                f"⚠️ «{family}» не найден в текущем сборе «{active[1]}» и в прошлых сборах.\n"
-                f"Проверьте написание или используйте /check."
-            )
+            if status == "ok":
+                ok_list.append(name or fam)
+            elif status == "already":
+                already_list.append(name or fam)
+            else:
+                notfound_list.append(fam)
+
+        lines = []
+        if target_title:
+            lines.append(f"💸 Отметки по сбору «{target_title}»:")
         else:
-            await update.message.reply_text(
-                f"⚠️ «{family}» не найден в прошлых сборах этого чата."
-            )
+            lines.append("💸 Отметки оплаты:")
+
+        if ok_list:
+            lines.append("✅ Отмечены: " + ", ".join(ok_list))
+        if already_list:
+            lines.append("ℹ️ Уже были: " + ", ".join(already_list))
+        if notfound_list:
+            lines.append("⚠️ Не найдены: " + ", ".join(notfound_list))
+        if past_multi:
+            lines.append("⚠️ Требуют уточнения (#N): " + ", ".join(past_multi))
+
+        await reply_auto(update, "\n".join(lines))
         return
 
 
@@ -1116,10 +1101,8 @@ def main():
     app.add_handler(CommandHandler("unpay", cmd_unpay))
     app.add_handler(CommandHandler("delcollection", cmd_delcollection))
     app.add_handler(CommandHandler("clearall", cmd_clearall))
-    app.add_handler(CommandHandler("setuser", cmd_setuser))
-    app.add_handler(CommandHandler("unsetuser", cmd_unsetuser))
-    app.add_handler(CommandHandler("users", cmd_users))
     app.add_handler(CommandHandler("bindold", cmd_bindold))
+    app.add_handler(CommandHandler("transfer_to", cmd_transfer_to))
     app.add_handler(CommandHandler("export_db", cmd_export_db))
     app.add_handler(CommandHandler("restart", cmd_restart))
 

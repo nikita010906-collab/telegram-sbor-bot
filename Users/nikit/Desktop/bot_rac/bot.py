@@ -920,6 +920,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lower = text.lower()
     chat_id = update.effective_chat.id
 
+    # ВРЕМЕННАЯ СТРОКА — покажет chat_id в логах BotHost
+    logging.info(f"CHAT_ID={chat_id} USER={update.effective_user.id} TEXT={text}")
+
     # 0) Подтверждение удаления всех сборов
     if _pending_clear.get(chat_id):
         del _pending_clear[chat_id]

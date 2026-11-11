@@ -1635,6 +1635,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/bindold — привязать старые сборы к этому чату\n"
         "/transfer_to <chat_id> — перенести сборы в другой чат\n"
         "/export_db — скачать файл базы данных\n"
+        "/import_db — восстановить базу из файла (ответом на .db)\n"
+        "/dbinfo — что лежит в базе\n"
         "/restart — перезапустить бота\n\n"
         "_Номера сборов всегда идут подряд: #1, #2, #3…_"
     )
@@ -2048,11 +2050,27 @@ async def cmd_import_db(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         shutil.move(tmp, DB_PATH)
         init_db()
 
-        cols = fetch_collections(update.effective_chat.id)
-        paid = sum(1 for c in cols for m in get_members(c["id"]) if m["paid"])
-        await reply_auto(
-            update,
-            f"✅ База восстановлена.\nСборов: {len(cols)}\nОтметок об оплате: {paid}",
+        with db() as conn:
+            total_cols = conn.execute(
+                "SELECT COUNT(*) FROM collections"
+            ).fetchone()[0]
+            total_members = conn.execute("SELECT COUNT(*) FROM members").fetchone()[0]
+            total_paid = conn.execute(
+                "SELECT COUNT(*) FROM members WHERE paid = 1"
+            ).fetchone()[0]
+
+        lines = [
+            "✅ *База восстановлена.*",
+            f"Сборов: *{total_cols}*",
+            f"Участников: *{total_members}*",
+            f"Отметок об оплате: *{total_paid}*",
+        ]
+        if total_cols and not fetch_collections(update.effective_chat.id):
+            lines.append(
+                "\n_В этом чате сборов нет — откройте /all там, где ведётся сбор._"
+            )
+        await update.message.reply_text(
+            "\n".join(lines), parse_mode=ParseMode.MARKDOWN
         )
     except Exception as exc:
         log.exception("Ошибка импорта базы")
@@ -2062,6 +2080,34 @@ async def cmd_import_db(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             except OSError:
                 pass
         await reply_auto(update, f"⚠️ Не удалось восстановить базу: {exc}")
+
+
+async def cmd_dbinfo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Что лежит в базе — быстрая проверка после обновлений."""
+    if not await ensure_admin(update):
+        return
+    with db() as conn:
+        cols = conn.execute("SELECT COUNT(*) FROM collections").fetchone()[0]
+        members = conn.execute("SELECT COUNT(*) FROM members").fetchone()[0]
+        paid = conn.execute(
+            "SELECT COUNT(*) FROM members WHERE paid = 1"
+        ).fetchone()[0]
+        fams = conn.execute("SELECT COUNT(*) FROM families").fetchone()[0]
+        chats = conn.execute(
+            "SELECT COUNT(DISTINCT chat_id) FROM collections"
+        ).fetchone()[0]
+    here = len(fetch_collections(update.effective_chat.id))
+    await update.message.reply_text(
+        "🗄 *Что в базе*\n\n"
+        f"Файл: `{DB_PATH}`\n"
+        f"Сборов: *{cols}*\n"
+        f"Участников: *{members}*\n"
+        f"Отметок об оплате: *{paid}*\n"
+        f"Фамилий в списке: *{fams}*\n"
+        f"Чатов со сборами: *{chats}*\n"
+        f"В этом чате сборов: *{here}*",
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
 
 async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2317,6 +2363,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("transfer_to", cmd_transfer_to))
     app.add_handler(CommandHandler("export_db", cmd_export_db))
     app.add_handler(CommandHandler("import_db", cmd_import_db))
+    app.add_handler(CommandHandler("dbinfo", cmd_dbinfo))
     app.add_handler(CommandHandler("restart", cmd_restart))
 
     app.add_handler(CallbackQueryHandler(on_callback))

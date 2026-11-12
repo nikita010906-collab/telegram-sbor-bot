@@ -37,10 +37,15 @@ import shutil
 import sqlite3
 import sys
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    ForceReply,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
@@ -81,7 +86,14 @@ try:
 except ValueError:
     AUTO_DELETE_SECONDS = 15
 
-SCHEMA_VERSION = 2
+# Часовой пояс для истории отметок (сервер живёт по UTC).
+# По умолчанию — Москва.
+try:
+    TIME_OFFSET_HOURS = int(os.getenv("TIME_OFFSET") or 3)
+except ValueError:
+    TIME_OFFSET_HOURS = 3
+
+SCHEMA_VERSION = 3
 
 
 def _db_richness(path: str) -> tuple[int, int, float]:
@@ -195,13 +207,30 @@ CREATE TABLE IF NOT EXISTS members (
     collection_id INTEGER NOT NULL,
     family TEXT NOT NULL,
     paid INTEGER DEFAULT 0,
-    paid_at TEXT
+    paid_at TEXT,
+    paid_amount INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS families (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_id INTEGER DEFAULT 0,
     name TEXT NOT NULL,
     UNIQUE(chat_id, name)
+);
+CREATE TABLE IF NOT EXISTS payments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    collection_id INTEGER,
+    collection_num INTEGER,
+    collection_title TEXT,
+    member_id INTEGER,
+    family TEXT,
+    amount INTEGER DEFAULT 0,
+    action TEXT NOT NULL,
+    actor_id INTEGER,
+    actor_name TEXT,
+    actor_is_admin INTEGER DEFAULT 0,
+    method TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS ui_messages (
     chat_id INTEGER NOT NULL,
@@ -273,6 +302,18 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE members ADD COLUMN paid INTEGER DEFAULT 0")
     if "paid_at" not in mem_cols:
         conn.execute("ALTER TABLE members ADD COLUMN paid_at TEXT")
+    if "paid_amount" not in mem_cols:
+        # новая схема: сколько человек уже внёс (для частичных сумм)
+        conn.execute(
+            "ALTER TABLE members ADD COLUMN paid_amount INTEGER DEFAULT 0"
+        )
+        # у старых отметок «сдал» сумма равна сумме сбора — переносим как есть
+        conn.execute(
+            "UPDATE members SET paid_amount = COALESCE("
+            "  (SELECT c.amount FROM collections c "
+            "   WHERE c.id = members.collection_id), 0) "
+            "WHERE paid = 1"
+        )
 
     fam_cols = _table_columns(conn, "families")
     if "chat_id" not in fam_cols:
@@ -309,6 +350,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_collections_chat "
         "ON collections(chat_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_payments_chat "
+        "ON payments(chat_id, id)"
     )
 
 
@@ -510,7 +555,7 @@ def get_active_collection(chat_id: int) -> Optional[dict]:
 def get_members(cid: int) -> list[dict]:
     with db() as conn:
         rows = conn.execute(
-            "SELECT id, family, paid, paid_at FROM members "
+            "SELECT id, family, paid, paid_at, paid_amount FROM members "
             "WHERE collection_id = ? ORDER BY family COLLATE NOCASE, id",
             (cid,),
         ).fetchall()
@@ -520,9 +565,34 @@ def get_members(cid: int) -> list[dict]:
             "family": r["family"],
             "paid": bool(r["paid"]),
             "paid_at": r["paid_at"],
+            "paid_amount": r["paid_amount"] or 0,
         }
         for r in rows
     ]
+
+
+def member_status(member: dict, due: int) -> str:
+    """paid — сдал полностью, partial — внёс часть, unpaid — ничего."""
+    if member["paid"]:
+        return "paid"
+    if due > 0 and (member.get("paid_amount") or 0) > 0:
+        return "partial"
+    return "unpaid"
+
+
+def member_remaining(member: dict, due: int) -> int:
+    """Сколько ещё должен человек в этом сборе."""
+    if member["paid"] or due <= 0:
+        return 0
+    return max(0, due - (member.get("paid_amount") or 0))
+
+
+def family_debt(chat_id: int, family: str) -> int:
+    """Общий остаток долга человека по всем сборам чата."""
+    return sum(
+        member_remaining(member, col["amount"])
+        for col, member in family_membership(chat_id, family)
+    )
 
 
 def create_collection(chat_id: int, title: str, families, amount: int = 0) -> int:
@@ -545,34 +615,53 @@ def create_collection(chat_id: int, title: str, families, amount: int = 0) -> in
     return cid
 
 
-def set_member_paid(mid: int, paid: bool) -> None:
+def set_member_payment(mid: int, paid_amount: int, paid: bool) -> None:
     with db() as conn:
         conn.execute(
-            "UPDATE members SET paid = ?, "
-            "paid_at = CASE WHEN ? = 1 THEN CURRENT_TIMESTAMP ELSE NULL END "
-            "WHERE id = ?",
-            (int(paid), int(paid), mid),
+            "UPDATE members SET paid_amount = ?, paid = ?, "
+            "paid_at = CASE WHEN ? = 1 THEN COALESCE(paid_at, CURRENT_TIMESTAMP) "
+            "ELSE NULL END WHERE id = ?",
+            (int(paid_amount), int(paid), int(paid), mid),
         )
 
 
-def toggle_member(mid: int, chat_id: int) -> Optional[dict]:
+def set_member_paid(mid: int, paid: bool, due: int = 0) -> None:
+    set_member_payment(mid, due if paid else 0, paid)
+
+
+def toggle_member(mid: int, chat_id: int, actor=None) -> Optional[dict]:
     """Переключает отметку. Возвращает данные участника или None."""
     with db() as conn:
         row = conn.execute(
-            "SELECT m.id, m.collection_id, m.family, m.paid "
+            "SELECT m.id, m.collection_id, m.family, m.paid, m.paid_amount, "
+            "       c.title, c.amount "
             "FROM members m JOIN collections c ON c.id = m.collection_id "
             "WHERE m.id = ? AND c.chat_id = ?",
             (mid, chat_id),
         ).fetchone()
         if not row:
             return None
+        due = row["amount"] or 0
+        before = row["paid_amount"] or 0
         new_paid = 0 if row["paid"] else 1
+        paid_amount = due if new_paid else 0
         conn.execute(
-            "UPDATE members SET paid = ?, "
-            "paid_at = CASE WHEN ? = 1 THEN CURRENT_TIMESTAMP ELSE NULL END "
-            "WHERE id = ?",
-            (new_paid, new_paid, mid),
+            "UPDATE members SET paid_amount = ?, paid = ?, "
+            "paid_at = CASE WHEN ? = 1 THEN COALESCE(paid_at, CURRENT_TIMESTAMP) "
+            "ELSE NULL END WHERE id = ?",
+            (paid_amount, new_paid, new_paid, mid),
         )
+    col = {
+        "id": row["collection_id"],
+        "title": row["title"],
+        "num": collection_num(chat_id, row["collection_id"]),
+        "amount": due,
+    }
+    added = max(0, due - before) if new_paid else before
+    log_payment(
+        chat_id, col, mid, row["family"], added,
+        "paid" if new_paid else "unpaid", actor, "button",
+    )
     return {
         "id": mid,
         "collection_id": row["collection_id"],
@@ -581,22 +670,41 @@ def toggle_member(mid: int, chat_id: int) -> Optional[dict]:
     }
 
 
-def set_collection_paid(cid: int, chat_id: int, paid: bool) -> int:
+def set_collection_paid(cid: int, chat_id: int, paid: bool, actor=None,
+                        method: str = "button") -> int:
     """Отметить/снять всех в сборе. Возвращает число изменённых записей."""
+    col = get_collection(cid, chat_id)
+    if not col:
+        return 0
+    due = col["amount"]
     with db() as conn:
-        row = conn.execute(
-            "SELECT 1 FROM collections WHERE id = ? AND chat_id = ?",
-            (cid, chat_id),
-        ).fetchone()
-        if not row:
+        members = conn.execute(
+            "SELECT id, family, paid, paid_amount FROM members "
+            "WHERE collection_id = ?",
+            (cid,),
+        ).fetchall()
+        changed = [m for m in members if bool(m["paid"]) != paid]
+        if not changed:
             return 0
-        cur = conn.execute(
-            "UPDATE members SET paid = ?, "
-            "paid_at = CASE WHEN ? = 1 THEN CURRENT_TIMESTAMP ELSE NULL END "
-            "WHERE collection_id = ? AND paid <> ?",
-            (int(paid), int(paid), cid, int(paid)),
+        for member in changed:
+            conn.execute(
+                "UPDATE members SET paid_amount = ?, paid = ?, "
+                "paid_at = CASE WHEN ? = 1 THEN COALESCE(paid_at, CURRENT_TIMESTAMP) "
+                "ELSE NULL END WHERE id = ?",
+                (due if paid else 0, int(paid), int(paid), member["id"]),
+            )
+    if changed:
+        added = 0
+        for member in changed:
+            if paid:
+                added += max(0, due - (member["paid_amount"] or 0))
+            else:
+                added += member["paid_amount"] or 0
+        log_payment(
+            chat_id, col, None, "все участники", added,
+            "paid_all" if paid else "unpaid_all", actor, method,
         )
-        return cur.rowcount or 0
+    return len(changed)
 
 
 def _match_member(members: list[dict], family: str) -> Optional[dict]:
@@ -613,7 +721,8 @@ def _match_member(members: list[dict], family: str) -> Optional[dict]:
     return None
 
 
-def mark_paid(cid: int, chat_id: int, family: str) -> tuple[str, Optional[str]]:
+def mark_paid(cid: int, chat_id: int, family: str, actor=None,
+              method: str = "text") -> tuple[str, Optional[str]]:
     col = get_collection(cid, chat_id)
     if not col:
         return "no_collection", None
@@ -622,20 +731,28 @@ def mark_paid(cid: int, chat_id: int, family: str) -> tuple[str, Optional[str]]:
         return "not_found", None
     if member["paid"]:
         return "already", member["family"]
-    set_member_paid(member["id"], True)
+    due = col["amount"]
+    before = member.get("paid_amount") or 0
+    set_member_payment(member["id"], due, True)
+    log_payment(chat_id, col, member["id"], member["family"],
+                max(0, due - before), "paid", actor, method)
     return "ok", member["family"]
 
 
-def unmark_paid(cid: int, chat_id: int, family: str) -> tuple[str, Optional[str]]:
+def unmark_paid(cid: int, chat_id: int, family: str, actor=None,
+                method: str = "command") -> tuple[str, Optional[str]]:
     col = get_collection(cid, chat_id)
     if not col:
         return "no_collection", None
     member = _match_member(get_members(cid), family)
     if not member:
         return "not_found", None
-    if not member["paid"]:
+    if not member["paid"] and not (member.get("paid_amount") or 0):
         return "already_unpaid", member["family"]
-    set_member_paid(member["id"], False)
+    was = member.get("paid_amount") or 0
+    set_member_payment(member["id"], 0, False)
+    log_payment(chat_id, col, member["id"], member["family"], was, "unpaid",
+                actor, method)
     return "ok", member["family"]
 
 
@@ -658,16 +775,188 @@ def find_unpaid_in_past(chat_id: int, family: str) -> list[tuple[dict, dict]]:
     ]
 
 
-def mark_family_everywhere(chat_id: int, family: str):
+def mark_family_everywhere(chat_id: int, family: str, actor=None,
+                           method: str = "button"):
     """Отмечает фамилию во всех сборах чата. -> (отмеченные сборы, уже были)."""
     marked, already = [], []
     for col, member in family_membership(chat_id, family):
         if member["paid"]:
             already.append(col)
         else:
-            set_member_paid(member["id"], True)
+            due = col["amount"]
+            before = member.get("paid_amount") or 0
+            set_member_payment(member["id"], due, True)
+            log_payment(chat_id, col, member["id"], member["family"],
+                        max(0, due - before), "paid", actor, method)
             marked.append(col)
     return marked, already
+
+
+def collection_num(chat_id: int, cid: int) -> int:
+    """Отображаемый номер сбора (#1, #2, ...)."""
+    with db() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) FROM collections WHERE chat_id = ? AND id <= ?",
+            (chat_id, cid),
+        ).fetchone()[0]
+
+
+def actor_info(user) -> Optional[dict]:
+    """Кто поставил отметку — для истории."""
+    if user is None:
+        return None
+    name = (getattr(user, "first_name", None) or "").strip()
+    username = getattr(user, "username", None)
+    if username:
+        name = f"{name} (@{username})".strip()
+    return {
+        "id": getattr(user, "id", None),
+        "name": name or "неизвестно",
+        "is_admin": is_admin(getattr(user, "id", 0)),
+    }
+
+
+def local_now_str() -> str:
+    """Время события в часовом поясе бота (сервер обычно живёт по UTC)."""
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    return (now + timedelta(hours=TIME_OFFSET_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def log_payment(chat_id: int, col: Optional[dict], member_id: Optional[int],
+                family: str, amount: int, action: str, actor=None,
+                method: str = "manual") -> None:
+    """Пишет событие в историю отметок."""
+    actor = actor or {}
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO payments (chat_id, collection_id, collection_num, "
+            "collection_title, member_id, family, amount, action, actor_id, "
+            "actor_name, actor_is_admin, method, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                chat_id,
+                col["id"] if col else None,
+                col.get("num") if col else None,
+                col["title"] if col else None,
+                member_id,
+                family,
+                int(amount or 0),
+                action,
+                actor.get("id"),
+                actor.get("name"),
+                1 if actor.get("is_admin") else 0,
+                method,
+                local_now_str(),
+            ),
+        )
+
+
+def history_entries(chat_id: int, limit: int = 10, offset: int = 0) -> list[dict]:
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT id, collection_num, collection_title, family, amount, action, "
+            "       actor_name, actor_is_admin, method, created_at "
+            "FROM payments WHERE chat_id = ? ORDER BY id DESC LIMIT ? OFFSET ?",
+            (chat_id, limit, offset),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def history_count(chat_id: int) -> int:
+    with db() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) FROM payments WHERE chat_id = ?", (chat_id,)
+        ).fetchone()[0]
+
+
+def parse_amount(text: str) -> Optional[int]:
+    """'300', '300 ₽', '1 500' -> число. Иначе None."""
+    if not text or str(text).strip().startswith("-"):
+        return None
+    digits = re.sub(r"[^\d]", "", str(text))
+    if not digits:
+        return None
+    value = int(digits)
+    if value <= 0 or value > 10_000_000:
+        return None
+    return value
+
+
+def apply_payment(chat_id: int, family: str, amount: int,
+                  cid: Optional[int] = None, actor=None,
+                  method: str = "dialog") -> dict:
+    """Распределяет внесённую сумму по долгам человека.
+
+    Долги закрываются по порядку сборов (сначала старые). Сбор, на который
+    суммы не хватило, уменьшается на остаток.
+    """
+    amount = int(amount or 0)
+    if amount <= 0:
+        return {"error": "amount"}
+
+    if cid is not None:
+        col = get_collection(cid, chat_id)
+        if not col:
+            return {"error": "no_collection"}
+        cols = [col]
+    else:
+        cols = fetch_collections(chat_id)
+
+    target = norm_name(family)
+    rows = []
+    for col in cols:
+        if not col["amount"]:
+            continue
+        for member in get_members(col["id"]):
+            if norm_name(member["family"]) != target:
+                continue
+            rows.append((col, member, member_remaining(member, col["amount"])))
+
+    if not family_membership(chat_id, family):
+        return {"error": "not_found"}
+    if not rows:
+        return {"error": "no_amount"}
+
+    total_debt_before = family_debt(chat_id, family)
+    if total_debt_before <= 0:
+        return {"error": "nothing_due", "debt_before": 0}
+
+    left = amount
+    allocations = []
+    for col, member, remaining in rows:
+        if left <= 0 or remaining <= 0:
+            continue
+        take = min(remaining, left)
+        paid_amount = (member.get("paid_amount") or 0) + take
+        fully = paid_amount >= col["amount"]
+        set_member_payment(member["id"], paid_amount, fully)
+        log_payment(
+            chat_id, col, member["id"], member["family"], take,
+            "full" if fully else "partial", actor, method,
+        )
+        allocations.append(
+            {
+                "col": col,
+                "take": take,
+                "remaining_after": max(0, col["amount"] - paid_amount),
+                "fully": fully,
+            }
+        )
+        left -= take
+
+    if not allocations:
+        return {
+            "error": "no_remaining_here",
+            "debt_before": total_debt_before,
+        }
+
+    return {
+        "allocations": allocations,
+        "leftover": left,
+        "amount": amount,
+        "debt_before": total_debt_before,
+        "debt_after": family_debt(chat_id, family),
+    }
 
 
 def get_families(chat_id: int) -> list[str]:
@@ -875,28 +1164,33 @@ def money(value: int) -> str:
 
 
 def render_debtors(chat_id: int) -> str:
-    """Общий список должников по всем сборам чата (как в старой версии)."""
+    """Общий список должников по всем сборам чата (с учётом частичных сумм)."""
     totals: dict[str, dict] = {}
     blocks = []
 
     for col in fetch_collections(chat_id):
+        amount = col["amount"]
         members = get_members(col["id"])
         unpaid = [m for m in members if not m["paid"]]
         if not unpaid:
             continue
-        amount = col["amount"]
         amount_str = f"по {amount} ₽" if amount else "сумма не указана"
         lines = [
             f"📌 *#{col['num']} «{md_escape(col['title'])}»* _{amount_str}_ — "
             f"сдало *{col['paid']}/{col['total']}*"
         ]
         for member in unpaid:
-            lines.append(f"   • {md_escape(member['family'])} — {money(amount)}")
+            remaining = member_remaining(member, amount)
+            if amount and 0 < remaining < amount:
+                tail = f"{remaining} ₽ из {amount}"
+            else:
+                tail = money(remaining) if amount else "—"
+            lines.append(f"   • {md_escape(member['family'])} — {tail}")
             key = norm_name(member["family"])
             agg = totals.setdefault(
                 key, {"name": member["family"], "sum": 0, "count": 0}
             )
-            agg["sum"] += amount
+            agg["sum"] += remaining
             agg["count"] += 1
         blocks.append("\n".join(lines))
 
@@ -911,9 +1205,9 @@ def render_debtors(chat_id: int) -> str:
 
 
 def render_collection_debtors(col: dict) -> str:
-    """Должники по одному сбору (старый формат `/debtors N`)."""
+    """Должники по одному сбору (`/debtors N`)."""
     members = get_members(col["id"])
-    unpaid = [m["family"] for m in members if not m["paid"]]
+    unpaid = [m for m in members if not m["paid"]]
     paid = [m["family"] for m in members if m["paid"]]
     amount = col["amount"]
 
@@ -927,9 +1221,14 @@ def render_collection_debtors(col: dict) -> str:
 
     lines = [header]
     total_debt = 0
-    for i, family in enumerate(unpaid, 1):
-        lines.append(f"{i}. {md_escape(family)} — {money(amount)}")
-        total_debt += amount
+    for i, member in enumerate(unpaid, 1):
+        remaining = member_remaining(member, amount)
+        total_debt += remaining
+        if amount and (member.get("paid_amount") or 0) > 0:
+            tail = f"{remaining} ₽ из {amount}"
+        else:
+            tail = money(remaining) if amount else "—"
+        lines.append(f"{i}. {md_escape(member['family'])} — {tail}")
     if amount:
         lines.append(f"\n💰 *Итого к сбору: {total_debt} ₽*")
     lines.append(f"\n✅ Сдало: {len(paid)}/{len(members)}")
@@ -945,17 +1244,26 @@ def render_all(chat_id: int) -> str:
 
     blocks = []
     for col in cols:
+        amount = col["amount"]
         members = get_members(col["id"])
         paid = [m["family"] for m in members if m["paid"]]
+        partial = [
+            m["family"] for m in members
+            if member_status(m, amount) == "partial"
+        ]
         unpaid = [m["family"] for m in members if not m["paid"]]
         status = "🟢 активный" if col["active"] else "⚪ завершён"
-        amount = f" • {col['amount']} ₽ с чел." if col["amount"] else ""
+        amount_str = f" • {amount} ₽ с чел." if amount else ""
         block = f"*#{col['num']} — {md_escape(col['title'])}*\n"
-        block += f"_Создан: {col['created_at']} • {status}{amount}_\n"
+        block += f"_Создан: {col['created_at']} • {status}{amount_str}_\n"
         block += (
             f"✅ Сдало ({len(paid)}/{len(members)}): "
             f"{md_escape(', '.join(paid)) or '—'}\n"
         )
+        if partial:
+            block += (
+                f"🟡 Частично ({len(partial)}): {md_escape(', '.join(partial))}\n"
+            )
         if unpaid:
             block += (
                 f"❌ Должники ({len(unpaid)}): {md_escape(', '.join(unpaid))}"
@@ -981,6 +1289,7 @@ def render_collection_page(chat_id: int, cid: int, page: int = 0):
 
     amount = col["amount"]
     paid_cnt = sum(1 for m in members if m["paid"])
+    remaining_total = sum(member_remaining(m, amount) for m in members)
     total = len(members)
 
     lines = [f"📌 *#{col['num']} «{md_escape(col['title'])}»*"]
@@ -990,15 +1299,23 @@ def render_collection_page(chat_id: int, cid: int, page: int = 0):
     lines.append("_" + " • ".join(meta) + "_")
     line = f"Сдало *{paid_cnt}/{total}*"
     if amount:
-        line += f" • осталось собрать *{(total - paid_cnt) * amount} ₽*"
+        line += f" • осталось собрать *{remaining_total} ₽*"
     lines.append(line)
     if total_pages > 1:
         lines.append(f"_Страница {page + 1}/{total_pages}_")
     lines.append("")
     for member in chunk:
-        lines.append(("✅ " if member["paid"] else "⬜ ") + md_escape(member["family"]))
+        status = member_status(member, amount)
+        if status == "partial":
+            lines.append(
+                f"🟡 {md_escape(member['family'])} — осталось "
+                f"{member_remaining(member, amount)} ₽"
+            )
+        else:
+            icon = "✅" if status == "paid" else "⬜"
+            lines.append(f"{icon} {md_escape(member['family'])}")
     lines.append("")
-    lines.append("_Нажмите на фамилию, чтобы отметить оплату._")
+    lines.append("_Нажмите на фамилию, чтобы отметить оплату полностью._")
     return "\n".join(lines), page, total_pages, chunk
 
 
@@ -1010,6 +1327,8 @@ ADMIN_PANEL_TEXT = (
     "⚙️ *Панель администратора*\n\n"
     "• *Сборы* — выбрать сбор и отметить, кто сдал\n"
     "• *Должники* — живой список, обновляется на месте\n"
+    "• *Внести сумму* — человек внёс часть/всё, распределю по долгам\n"
+    "• *История* — кто и когда ставил отметки\n"
     "• *Сдали все сборы* — отметить человека сразу во всех сборах\n\n"
     "_Кнопки видит только администратор. Панель показывает сборы того чата,_\n"
     "_в котором вы её открыли._"
@@ -1026,6 +1345,10 @@ def main_menu_kb() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("📋 Сборы", callback_data="cl:0")],
             [InlineKeyboardButton("💸 Живой список должников", callback_data="dv")],
             [InlineKeyboardButton("✅ Сдали все сборы", callback_data="af:0")],
+            [
+                InlineKeyboardButton("💰 Внести сумму", callback_data="pf:0:0"),
+                InlineKeyboardButton("📜 История", callback_data="h:0"),
+            ],
             [
                 InlineKeyboardButton("🆕 Новый сбор", callback_data="nw"),
                 InlineKeyboardButton("👥 Фамилии", callback_data="fl"),
@@ -1068,11 +1391,17 @@ def collections_kb(chat_id: int, page: int = 0) -> InlineKeyboardMarkup:
 def collection_kb(
     chat_id: int, cid: int, page: int, total_pages: int, chunk: list[dict]
 ) -> InlineKeyboardMarkup:
+    col = get_collection(cid, chat_id) or {}
+    amount = col.get("amount") or 0
+
     rows = []
     for i in range(0, len(chunk), 2):
         row = []
         for member in chunk[i:i + 2]:
-            label = ("✅ " if member["paid"] else "⬜ ") + shorten(member["family"], 18)
+            icon = {"paid": "✅", "partial": "🟡"}.get(
+                member_status(member, amount), "⬜"
+            )
+            label = f"{icon} {shorten(member['family'], 18)}"
             row.append(
                 InlineKeyboardButton(
                     label, callback_data=f"t:{cid}:{page}:{member['id']}"
@@ -1101,11 +1430,72 @@ def collection_kb(
     )
     rows.append(
         [
+            InlineKeyboardButton("💰 Внести сумму", callback_data=f"pf:{cid}:0"),
             InlineKeyboardButton("🔄 Обновить", callback_data=f"c:{cid}:{page}"),
-            InlineKeyboardButton("🗑 Удалить сбор", callback_data=f"dc:{cid}"),
         ]
     )
+    rows.append([InlineKeyboardButton("🗑 Удалить сбор", callback_data=f"dc:{cid}")])
     rows.append([InlineKeyboardButton("⬅️ К списку сборов", callback_data="cl:0")])
+    rows.append([InlineKeyboardButton("⚙️ Меню", callback_data="m")])
+    return kb(rows)
+
+
+def pay_families_kb(chat_id: int, page: int = 0, cid: int = 0) -> InlineKeyboardMarkup:
+    """Выбор человека для ввода суммы."""
+    fams = family_rows(chat_id)
+    total_pages = max(1, (len(fams) + FAMILIES_PER_PAGE - 1) // FAMILIES_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+    chunk = fams[page * FAMILIES_PER_PAGE:(page + 1) * FAMILIES_PER_PAGE]
+
+    rows = []
+    for i in range(0, len(chunk), 2):
+        row = []
+        for fam in chunk[i:i + 2]:
+            row.append(
+                InlineKeyboardButton(
+                    shorten(fam["name"], 20),
+                    callback_data=f"pfs:{cid}:{fam['id']}",
+                )
+            )
+        rows.append(row)
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(
+                InlineKeyboardButton("⬅️", callback_data=f"pf:{cid}:{page - 1}")
+            )
+        nav.append(
+            InlineKeyboardButton(
+                f"{page + 1}/{total_pages}", callback_data=f"pf:{cid}:{page}"
+            )
+        )
+        if page < total_pages - 1:
+            nav.append(
+                InlineKeyboardButton("➡️", callback_data=f"pf:{cid}:{page + 1}")
+            )
+        rows.append(nav)
+    if cid:
+        rows.append(
+            [InlineKeyboardButton("⬅️ К сбору", callback_data=f"c:{cid}:0")]
+        )
+    rows.append([InlineKeyboardButton("⚙️ Меню", callback_data="m")])
+    return kb(rows)
+
+
+def history_kb(chat_id: int, page: int, total_pages: int) -> InlineKeyboardMarkup:
+    rows = []
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️", callback_data=f"h:{page - 1}"))
+        nav.append(
+            InlineKeyboardButton(
+                f"{page + 1}/{total_pages}", callback_data=f"h:{page}"
+            )
+        )
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton("➡️", callback_data=f"h:{page + 1}"))
+        rows.append(nav)
     rows.append([InlineKeyboardButton("⚙️ Меню", callback_data="m")])
     return kb(rows)
 
@@ -1330,7 +1720,7 @@ async def show_family_confirm(bot, chat_id: int, message_id: int, fid: int) -> N
 
 
 async def apply_family_everywhere(bot, chat_id: int, message_id: int,
-                                  fid: int) -> None:
+                                  fid: int, actor=None) -> None:
     family = get_family(chat_id, fid)
     if not family:
         await safe_edit(
@@ -1338,7 +1728,7 @@ async def apply_family_everywhere(bot, chat_id: int, message_id: int,
         )
         return
 
-    marked, already = mark_family_everywhere(chat_id, family["name"])
+    marked, already = mark_family_everywhere(chat_id, family["name"], actor)
     lines = [f"✅ *{md_escape(family['name'])}* — оплата отмечена."]
     if marked:
         lines.append(f"\nОтмечено в *{len(marked)}* сборах:")
@@ -1354,12 +1744,230 @@ async def apply_family_everywhere(bot, chat_id: int, message_id: int,
     )
 
 
+# ---------- Частичные суммы и история ----------
+
+HISTORY_PER_PAGE = 10
+
+PAYMENT_ACTIONS = {
+    "paid": "✅ оплачено",
+    "partial": "🟡 внесено частично",
+    "full": "✅ закрыт сбор",
+    "unpaid": "↩️ отметка снята",
+    "paid_all": "✅ отмечены все",
+    "unpaid_all": "↩️ сняты все",
+}
+
+METHOD_LABELS = {
+    "button": "кнопкой",
+    "text": "текстом",
+    "command": "командой",
+    "dialog": "через «Внести сумму»",
+}
+
+_pending_payment: dict[tuple[int, int], dict] = {}
+
+
+def render_pay_prompt(chat_id: int, family: dict, cid: int = 0) -> str:
+    total = family_debt(chat_id, family["name"])
+    lines = [f"💰 Сколько сдал(а) *{md_escape(family['name'])}*?"]
+    if cid:
+        col = get_collection(cid, chat_id)
+        if col:
+            member = _match_member(get_members(cid), family["name"])
+            remaining = member_remaining(member, col["amount"]) if member else 0
+            lines.append(
+                f"\nСбор *#{col['num']} «{md_escape(col['title'])}»*: "
+                f"осталось *{remaining} ₽*"
+            )
+            if total and total != remaining:
+                lines.append(f"Долг по всем сборам: *{total} ₽*")
+    else:
+        lines.append(f"\nВсего долг: *{total} ₽*")
+        lines.append("_Сумма пойдёт по порядку — сначала старые сборы._")
+    lines.append("\n_Пришлите сумму числом, например 300._")
+    lines.append("_Отмена — /cancel._")
+    return "\n".join(lines)
+
+
+def render_payment_result(family_name: str, result: dict) -> str:
+    error = result.get("error")
+    if error == "not_found":
+        return f"⚠️ «{md_escape(family_name)}» не найден ни в одном сборе."
+    if error == "no_amount":
+        return (
+            f"⚠️ У «{md_escape(family_name)}» есть сборы, но без указанной суммы — "
+            "распределить нельзя. Отметьте оплату вручную."
+        )
+    if error == "nothing_due":
+        return f"ℹ️ У «{md_escape(family_name)}» нет долгов — всё сдано."
+    if error == "no_remaining_here":
+        return (
+            f"ℹ️ В этом сборе у «{md_escape(family_name)}» долга нет — "
+            "сумма не распределена."
+        )
+    if error == "no_collection":
+        return "⚠️ Сбор не найден."
+    if error:
+        return "⚠️ Не удалось принять сумму."
+
+    lines = [
+        f"💰 *{md_escape(family_name)}* — внесено *{result['amount']} ₽*",
+        "",
+    ]
+    for alloc in result["allocations"]:
+        col = alloc["col"]
+        if alloc["fully"]:
+            lines.append(f"• #{col['num']} «{md_escape(col['title'])}» — ✅ закрыт")
+        else:
+            lines.append(
+                f"• #{col['num']} «{md_escape(col['title'])}» — 🟡 осталось "
+                f"*{alloc['remaining_after']} ₽* из {col['amount']}"
+            )
+    if result["leftover"]:
+        lines.append(
+            f"\n⚠️ Не распределено: *{result['leftover']} ₽* "
+            "(долг меньше внесённой суммы)."
+        )
+    lines.append(f"\nИтого долг: *{result['debt_after']} ₽*")
+    return "\n".join(lines)
+
+
+def render_history_page(chat_id: int, page: int = 0):
+    total = history_count(chat_id)
+    total_pages = max(1, (total + HISTORY_PER_PAGE - 1) // HISTORY_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+    entries = history_entries(chat_id, HISTORY_PER_PAGE, page * HISTORY_PER_PAGE)
+
+    if not entries:
+        text = (
+            "📜 *История отметок*\n"
+            "_Видит только администратор._\n\n"
+            "Пока пусто. Здесь будут появляться все отметки — и ваши, "
+            "и тех, кто отметился сам."
+        )
+        return text, page, total_pages
+
+    lines = ["📜 *История отметок*", "_Видит только администратор._\n"]
+    for entry in entries:
+        when = entry["created_at"] or ""
+        try:
+            when = datetime.strptime(when, "%Y-%m-%d %H:%M:%S").strftime("%d.%m %H:%M")
+        except ValueError:
+            pass
+        label = PAYMENT_ACTIONS.get(entry["action"], entry["action"])
+        amount = f"{entry['amount']} ₽" if entry["amount"] else "—"
+        lines.append(
+            f"{when} • {label} — *{md_escape(entry['family'])}*, {amount}"
+        )
+        meta = []
+        if entry["collection_num"]:
+            meta.append(
+                f"#{entry['collection_num']} "
+                f"«{md_escape(entry['collection_title'] or '')}»"
+            )
+        role = "👑 админ" if entry["actor_is_admin"] else "👤 участник"
+        who = md_escape(entry["actor_name"] or "неизвестно")
+        method = METHOD_LABELS.get(entry["method"] or "", "")
+        meta.append(f"{role}: {who}" + (f" ({method})" if method else ""))
+        lines.append("   " + " • ".join(meta))
+    if total_pages > 1:
+        lines.append(f"\n_Страница {page + 1}/{total_pages} — всего {total} записей._")
+    return "\n".join(lines), page, total_pages
+
+
+async def show_pay_families(bot, chat_id: int, message_id: int,
+                            page: int = 0, cid: int = 0) -> None:
+    fams = family_rows(chat_id)
+    if not fams:
+        await safe_edit(
+            bot, chat_id, message_id,
+            "👥 Список фамилий пуст.\n\nЗадайте его командой:\n"
+            "`/setfamilies`\nИванов\nПетров",
+            main_menu_kb(),
+        )
+        return
+
+    total_pages = max(1, (len(fams) + FAMILIES_PER_PAGE - 1) // FAMILIES_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+
+    text = "💰 *Внести сумму*\n\nВыберите человека — спрошу, сколько он сдал."
+    if cid:
+        col = get_collection(cid, chat_id)
+        if col:
+            text = (
+                f"💰 *Внести сумму*\n\n"
+                f"Сбор *#{col['num']} «{md_escape(col['title'])}»*.\n"
+                "Выберите человека — спрошу, сколько он сдал."
+            )
+    if total_pages > 1:
+        text += f"\n_Страница {page + 1}/{total_pages}_"
+    await safe_edit(bot, chat_id, message_id, text, pay_families_kb(chat_id, page, cid))
+
+
+async def ask_payment_amount(bot, chat_id: int, user_id: int, family: dict,
+                             cid: int = 0) -> None:
+    _pending_payment[(chat_id, user_id)] = {
+        "family": family["name"],
+        "fid": family["id"],
+        "cid": cid or 0,
+    }
+    await bot.send_message(
+        chat_id=chat_id,
+        text=render_pay_prompt(chat_id, family, cid),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=ForceReply(selective=True),
+    )
+
+
+async def show_history(bot, chat_id: int, message_id: int, page: int = 0) -> None:
+    text, page, total_pages = render_history_page(chat_id, page)
+    await safe_edit(bot, chat_id, message_id, text, history_kb(chat_id, page, total_pages))
+
+
+async def process_pending_payment(update: Update,
+                                  context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Ждём сумму после «Внести сумму». True — сообщение обработано."""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    key = (chat_id, user_id)
+    pending = _pending_payment.pop(key, None)
+    if not pending:
+        return False
+
+    text = (update.message.text or "").strip()
+    if text.lower() in ("/cancel", "отмена", "cancel", "нет"):
+        await reply_auto(update, "❌ Ввод суммы отменён.")
+        return True
+
+    amount = parse_amount(text)
+    if amount is None:
+        _pending_payment[key] = pending
+        await reply_auto(
+            update,
+            "⚠️ Пришлите сумму числом, например 300 (или /cancel).",
+        )
+        return True
+
+    actor = actor_info(update.effective_user)
+    result = apply_payment(
+        chat_id, pending["family"], amount,
+        cid=pending.get("cid") or None, actor=actor, method="dialog",
+    )
+    await update.message.reply_text(
+        render_payment_result(pending["family"], result),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    await refresh_debtors(context, chat_id)
+    return True
+
+
 async def handle_callback(query, context: ContextTypes.DEFAULT_TYPE,
                           chat_id: int, data: str) -> None:
     bot = context.bot
     message = query.message
     message_id = message.message_id
     parts = data.split(":")
+    actor = actor_info(query.from_user)
 
     if data == "m":
         await query.answer()
@@ -1388,7 +1996,7 @@ async def handle_callback(query, context: ContextTypes.DEFAULT_TYPE,
 
     if parts[0] == "t" and len(parts) >= 4:
         cid, page, mid = _to_int(parts[1]), _to_int(parts[2]), _to_int(parts[3])
-        changed = toggle_member(mid, chat_id)
+        changed = toggle_member(mid, chat_id, actor)
         if not changed:
             await query.answer("Участник не найден", show_alert=True)
             return
@@ -1403,7 +2011,7 @@ async def handle_callback(query, context: ContextTypes.DEFAULT_TYPE,
         cid = _to_int(parts[1])
         page = _to_int(parts[2]) if len(parts) > 2 else 0
         mark = parts[0] == "pa"
-        count = set_collection_paid(cid, chat_id, mark)
+        count = set_collection_paid(cid, chat_id, mark, actor, "button")
         await query.answer(
             (f"✅ Отмечено: {count}" if mark else f"↩️ Снято: {count}")
         )
@@ -1461,8 +2069,35 @@ async def handle_callback(query, context: ContextTypes.DEFAULT_TYPE,
 
     if parts[0] == "ay" and len(parts) >= 2:
         await query.answer("Отмечаю…")
-        await apply_family_everywhere(bot, chat_id, message_id, _to_int(parts[1]))
+        await apply_family_everywhere(
+            bot, chat_id, message_id, _to_int(parts[1]), actor
+        )
         await refresh_debtors(context, chat_id)
+        return
+
+    if parts[0] == "pf" and len(parts) >= 2:
+        cid = _to_int(parts[1])
+        page = _to_int(parts[2]) if len(parts) > 2 else 0
+        await query.answer()
+        await show_pay_families(bot, chat_id, message_id, page, cid)
+        return
+
+    if parts[0] == "pfs" and len(parts) >= 3:
+        cid, fid = _to_int(parts[1]), _to_int(parts[2])
+        family = get_family(chat_id, fid)
+        if not family:
+            await query.answer("Фамилия не найдена", show_alert=True)
+            return
+        await query.answer("Введите сумму")
+        await ask_payment_amount(
+            bot, chat_id, query.from_user.id, family, cid
+        )
+        return
+
+    if parts[0] == "h":
+        page = _to_int(parts[1]) if len(parts) > 1 else 0
+        await query.answer()
+        await show_history(bot, chat_id, message_id, page)
         return
 
     if data == "fl":
@@ -1630,6 +2265,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/all — все сборы в этом чате\n"
         "/check <Фамилия> — где числится фамилия\n"
         "/unpay <Фамилия> [#N] — вернуть в должники\n"
+        "/pay <Фамилия> <сумма> [#N] — внести часть суммы\n"
         "/delcollection #N — удалить сбор по номеру\n"
         "/clearall — удалить все сборы в этом чате\n"
         "/bindold — привязать старые сборы к этому чату\n"
@@ -1866,7 +2502,9 @@ async def cmd_unpay(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await reply_auto(update, f"⚠️ Сбор #{num} не найден.")
             return
 
-    status, name = unmark_paid(col["id"], chat_id, family)
+    status, name = unmark_paid(
+        col["id"], chat_id, family, actor_info(update.effective_user), "command"
+    )
     if status == "ok":
         await reply_auto(
             update,
@@ -1879,6 +2517,67 @@ async def cmd_unpay(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
     else:
         await reply_auto(update, f"⚠️ «{family}» не найден в сборе «{col['title']}».")
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отмена ввода суммы."""
+    key = (update.effective_chat.id, update.effective_user.id)
+    if _pending_payment.pop(key, None):
+        await reply_auto(update, "❌ Ввод суммы отменён.")
+    else:
+        await reply_auto(update, "Нечего отменять.")
+
+
+async def cmd_pay(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Частичная оплата: /pay Иванов 300 [#2]."""
+    if not await ensure_admin(update):
+        return
+    chat_id = update.effective_chat.id
+    text = update.message.text or ""
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await update.message.reply_text(
+            "Использование:\n"
+            "• `/pay Иванов 300` — распределить по всем долгам\n"
+            "• `/pay Иванов 300 #2` — только в сбор №2",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    body = parts[1].strip()
+    num = None
+    match = re.search(r"#\s*(\d+)\s*$", body)
+    if match:
+        num = int(match.group(1))
+        body = body[: match.start()].strip()
+
+    match = re.search(r"(\d[\d\s]*)\s*$", body)
+    if not match:
+        await reply_auto(update, "⚠️ Укажите сумму: /pay Иванов 300")
+        return
+
+    amount = parse_amount(match.group(1))
+    family = body[: match.start()].strip()
+    if not family or amount is None:
+        await reply_auto(update, "⚠️ Укажите фамилию и сумму: /pay Иванов 300")
+        return
+
+    cid = None
+    if num is not None:
+        col = collection_by_number(chat_id, num)
+        if not col:
+            await reply_auto(update, f"⚠️ Сбор #{num} не найден.")
+            return
+        cid = col["id"]
+
+    result = apply_payment(
+        chat_id, family, amount, cid=cid,
+        actor=actor_info(update.effective_user), method="command",
+    )
+    await update.message.reply_text(
+        render_payment_result(family, result), parse_mode=ParseMode.MARKDOWN
+    )
+    await refresh_debtors(context, chat_id)
 
 
 async def cmd_delcollection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2096,6 +2795,7 @@ async def cmd_dbinfo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         chats = conn.execute(
             "SELECT COUNT(DISTINCT chat_id) FROM collections"
         ).fetchone()[0]
+        payments = conn.execute("SELECT COUNT(*) FROM payments").fetchone()[0]
     here = len(fetch_collections(update.effective_chat.id))
     await update.message.reply_text(
         "🗄 *Что в базе*\n\n"
@@ -2103,6 +2803,7 @@ async def cmd_dbinfo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"Сборов: *{cols}*\n"
         f"Участников: *{members}*\n"
         f"Отметок об оплате: *{paid}*\n"
+        f"Записей в истории: *{payments}*\n"
         f"Фамилий в списке: *{fams}*\n"
         f"Чатов со сборами: *{chats}*\n"
         f"В этом чате сборов: *{here}*",
@@ -2134,7 +2835,11 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     log.info("CHAT_ID=%s USER=%s TEXT=%s", chat_id, user_id, text)
 
-    # 0) Подтверждение удаления всех сборов
+    # 0) Ждём сумму после кнопки «Внести сумму»
+    if await process_pending_payment(update, context):
+        return
+
+    # 0.1) Подтверждение удаления всех сборов
     if _pending_clear.get(chat_id):
         del _pending_clear[chat_id]
         if lower == "да":
@@ -2209,6 +2914,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def handle_paid_items(update: Update, context: ContextTypes.DEFAULT_TYPE,
                             paid_items: list[tuple[str, Optional[int]]]) -> None:
     chat_id = update.effective_chat.id
+    actor = actor_info(update.effective_user)
 
     # --- Одиночный вариант ---
     if len(paid_items) == 1:
@@ -2219,7 +2925,7 @@ async def handle_paid_items(update: Update, context: ContextTypes.DEFAULT_TYPE,
             if not col:
                 await reply_auto(update, f"⚠️ Сбор #{explicit_num} не найден.")
                 return
-            status, name = mark_paid(col["id"], chat_id, family)
+            status, name = mark_paid(col["id"], chat_id, family, actor, "text")
             if status == "ok":
                 await reply_auto(
                     update, f"✅ {name} — оплата отмечена (#{col['num']})."
@@ -2253,10 +2959,12 @@ async def handle_paid_items(update: Update, context: ContextTypes.DEFAULT_TYPE,
         past = find_unpaid_in_past(chat_id, family)
         if len(past) == 1:
             col, member = past[0]
-            set_member_paid(member["id"], True)
+            status, name = mark_paid(
+                col["id"], chat_id, member["family"], actor, "text"
+            )
             await reply_auto(
                 update,
-                f"✅ {member['family']} — оплата отмечена в прошлом сборе "
+                f"✅ {name or member['family']} — оплата отмечена в прошлом сборе "
                 f"«{col['title']}» (#{col['num']}).",
             )
             await refresh_debtors(context, chat_id)
@@ -2294,15 +3002,16 @@ async def handle_paid_items(update: Update, context: ContextTypes.DEFAULT_TYPE,
             if not col:
                 notfound_list.append(f"{family} (#{num} не найден)")
                 continue
-            status, name = mark_paid(col["id"], chat_id, family)
+            status, name = mark_paid(col["id"], chat_id, family, actor, "text")
         elif target:
-            status, name = mark_paid(target["id"], chat_id, family)
+            status, name = mark_paid(target["id"], chat_id, family, actor, "text")
         else:
             past = find_unpaid_in_past(chat_id, family)
             if len(past) == 1:
                 col, member = past[0]
-                set_member_paid(member["id"], True)
-                status, name = "ok", member["family"]
+                status, name = mark_paid(
+                    col["id"], chat_id, member["family"], actor, "text"
+                )
             elif len(past) > 1:
                 past_multi.append(family)
                 continue
@@ -2356,6 +3065,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("all", cmd_all))
     app.add_handler(CommandHandler("check", cmd_check))
     app.add_handler(CommandHandler("debtors", cmd_debtors))
+    app.add_handler(CommandHandler("pay", cmd_pay))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("unpay", cmd_unpay))
     app.add_handler(CommandHandler("delcollection", cmd_delcollection))
     app.add_handler(CommandHandler("clearall", cmd_clearall))

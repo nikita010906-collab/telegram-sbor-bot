@@ -63,6 +63,8 @@ from telegram.ext import (
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+BOT_VERSION = "3.0"
+
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 
 
@@ -2799,6 +2801,7 @@ async def cmd_dbinfo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     here = len(fetch_collections(update.effective_chat.id))
     await update.message.reply_text(
         "🗄 *Что в базе*\n\n"
+        f"Версия бота: *{BOT_VERSION}*\n"
         f"Файл: `{DB_PATH}`\n"
         f"Сборов: *{cols}*\n"
         f"Участников: *{members}*\n"
@@ -3089,11 +3092,12 @@ def main() -> None:
         sys.exit(1)
 
     init_db()
+    log.info("Версия бота: %s", BOT_VERSION)
     log.info("База данных: %s", DB_PATH)
     log.info("Администраторы: %s", ADMIN_IDS)
 
     app = build_app()
-    print("Бот запущен…")
+    print(f"Бот запущен (v{BOT_VERSION})…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
